@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    /* Configurações Básicas */
+    "target": "es2016",                                  /* Versão do JavaScript gerado */
+    "module": "commonjs",                                /* O segredo: converte import para require pro Node entender */
+    "moduleResolution": "node",                          /* Como o TS acha os arquivos */
+    "esModuleInterop": true,                             /* Permite importar libs antigas (CommonJS) como se fossem novas */
+    "forceConsistentCasingInFileNames": true,            /* Evita erros de maiúsculas/minúsculas em arquivos */
+    "strict": true,                                      /* Ativa a verificação rigorosa (segurança) */
+    "skipLibCheck": true,                                /* Pula verificação de arquivos de definição (economiza tempo) */
+    "outDir": "./dist",                                  /* Onde o código compilado vai ficar */
+    "rootDir": "./src",                                  /* Onde seu código fonte está */
+    
+    /* A correção específica para o seu erro */
+    "verbatimModuleSyntax": false                        /* Desativa a regra que estava travando tudo */
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"]
+}
