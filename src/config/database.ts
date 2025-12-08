@@ -13,11 +13,11 @@ const pool = mysql.createPool({
     // ⚠️ Correção importante: O TypeScript exige que a porta seja NUMBER.
     // O .env retorna string, então convertemos com Number()
     port: Number(process.env.DB_PORT) || 4000,
-    // ssl: {
-    //     minVersion: 'TLSv1.2',
-    //     rejectUnauthorized: true // Obrigatório para o TiDB Cloud
-    // },
-    // waitForConnections: true,
+    ssl: {
+        minVersion: 'TLSv1.2',
+        rejectUnauthorized: true // Obrigatório para o TiDB Cloud
+    },
+    waitForConnections: true,
     connectionLimit: 10, // Mantém até 10 conexões abertas prontas pra uso
     queueLimit: 0
 });
