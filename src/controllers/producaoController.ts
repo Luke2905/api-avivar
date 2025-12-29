@@ -151,3 +151,87 @@ export const listarMinhaProducao = async (req: Request, res: Response) => {
         res.status(500).json({ mensagem: 'Erro ao buscar produção.' });
     }
 };
+
+export const baixarEstoquePedido = async (req: Request, res: Response) => {
+    const { idPedido } = req.params;
+    
+    const connection = await pool.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        // 1. QUERY INTELIGENTE (AGRUPADA)
+        // Descobre quanto precisa de cada material para o pedido inteiro.
+        // Se o pedido tem "2 Canecas" e "3 Camisetas", e ambos usam "Tinta Preta",
+        // o SUM agrupa tudo para fazermos uma baixa só por material.
+        const queryCalculo = `
+            SELECT 
+                m.ID_MATERIA,
+                m.NOME_MATERIA,
+                m.SALDO_ESTOQUE,
+                SUM(ft.QTD_CONSUMO * ip.QUANTIDADE) as TOTAL_NECESSARIO
+            FROM ITEM_PEDIDO ip
+            JOIN FICHA_TECNICA ft ON ip.ID_PRODUTO = ft.ID_PRODUTO
+            JOIN MATERIA_PRIMA m ON ft.ID_MATERIA = m.ID_MATERIA
+            WHERE ip.ID_PEDIDO = ?
+            GROUP BY m.ID_MATERIA, m.NOME_MATERIA, m.SALDO_ESTOQUE
+        `;
+
+        const [materiaisParaBaixar]: any = await connection.query(queryCalculo, [idPedido]);
+
+        if (materiaisParaBaixar.length === 0) {
+            await connection.rollback();
+            // Retorna sucesso pois não é erro, é só que o produto não consome nada (ex: serviço)
+            return res.json({ mensagem: 'Pedido não possui itens com ficha técnica.', insumos_baixados: 0 });
+        }
+
+        // 2. VALIDAÇÃO DE SALDO (Segurança antes de mexer)
+        for (const item of materiaisParaBaixar) {
+            if (Number(item.SALDO_ESTOQUE) < Number(item.TOTAL_NECESSARIO)) {
+                await connection.rollback();
+                return res.status(400).json({ 
+                    mensagem: `Estoque insuficiente para "${item.NOME_MATERIA}". Necessário: ${item.TOTAL_NECESSARIO}, Atual: ${item.SALDO_ESTOQUE}` 
+                });
+            }
+        }
+
+        // 3. EXECUÇÃO (Atualiza Saldo + Grava Histórico)
+        let contador = 0;
+
+        for (const item of materiaisParaBaixar) {
+            const qtdBaixar = Number(item.TOTAL_NECESSARIO);
+            const saldoAntigo = Number(item.SALDO_ESTOQUE);
+            const saldoNovo = saldoAntigo - qtdBaixar;
+
+            // A) Atualiza a tabela principal (Onde mostramos no Dashboard)
+            await connection.query(
+                'UPDATE MATERIA_PRIMA SET SALDO_ESTOQUE = ? WHERE ID_MATERIA = ?',
+                [saldoNovo, item.ID_MATERIA]
+            );
+
+            // B) Cria o LOG na tabela de movimento (Rastreabilidade)
+            await connection.query(
+                `INSERT INTO MOVIMENTO_ESTOQUE 
+                (ID_MATERIA, TIPO_MOVIMENTO, QTD_MOVIMENTADA, SALDO_ANTERIOR, SALDO_NOVO, ID_PEDIDO_REF) 
+                VALUES (?, 'SAIDA_OP', ?, ?, ?, ?)`,
+                [item.ID_MATERIA, qtdBaixar, saldoAntigo, saldoNovo, idPedido]
+            );
+
+            contador++;
+        }
+
+        await connection.commit();
+        
+        res.json({ 
+            mensagem: 'Baixa realizada e histórico registrado!', 
+            insumos_baixados: contador 
+        });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error('Erro crítico na baixa:', error);
+        res.status(500).json({ mensagem: 'Erro interno ao movimentar estoque.' });
+    } finally {
+        connection.release();
+    }
+};

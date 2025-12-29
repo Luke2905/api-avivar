@@ -12,6 +12,7 @@ import compraRoutes from './routes/compraRoutes';
 import scannerRoutes from './routes/scannerRoutes';
 import iaRoutes from './routes/iaRoutes';
 import uploadRoutes from './routes/uploadRoutes';
+import financeiroRoutes from './routes/financeiroRoutes'
 
 const app = express();
 
@@ -30,6 +31,7 @@ app.use('/api/compras', compraRoutes);
 app.use('/api/scanner', scannerRoutes);
 app.use('/api/ia', iaRoutes);
 app.use('/api/upload', uploadRoutes);
+app.use('/api/financeiro', financeiroRoutes);
 
 app.get('/', (req, res) => {
     res.json({ mensagem: 'API Online' });
