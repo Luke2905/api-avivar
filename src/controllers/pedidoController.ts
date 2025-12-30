@@ -257,3 +257,51 @@ export const atualizarNotaFiscal = async (req: Request, res: Response) => {
         connection.release();
     }
 };
+
+export const atualizarPedido = async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { nome_cliente, num_pedido, plataforma, valor_total, itens } = req.body;
+    // 'itens' espera um array: [{ id_produto, quantidade, valor_unitario }]
+
+    const connection = await pool.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        // 1. Atualiza os dados do cabeçalho do PEDIDO
+        await connection.query(`
+            UPDATE PEDIDO 
+            SET NOME_CLIENTE = ?, 
+                NUM_PEDIDO_PLATAFORMA = ?, 
+                PLATAFORMA_ORIGEM = ?, 
+                VALOR_TOTAL = ?
+            WHERE ID_PEDIDO = ?
+        `, [nome_cliente, num_pedido, plataforma, valor_total, id]);
+
+        // 2. Atualiza os ITENS (Estratégia: Remove tudo e insere de novo)
+        // Essa é a estratégia mais segura e simples para garantir que a lista fique igual ao front
+        
+        // Primeiro, limpa os itens antigos desse pedido
+        await connection.query('DELETE FROM ITEM_PEDIDO WHERE ID_PEDIDO = ?', [id]);
+
+        // Depois, insere os itens novos (se houver)
+        if (itens && itens.length > 0) {
+            for (const item of itens) {
+                await connection.query(`
+                    INSERT INTO ITEM_PEDIDO (ID_PEDIDO, ID_PRODUTO, QUANTIDADE, VALOR_UNITARIO)
+                    VALUES (?, ?, ?, ?)
+                `, [id, item.id_produto, item.quantidade, item.valor_unitario]);
+            }
+        }
+
+        await connection.commit();
+        res.json({ mensagem: 'Pedido atualizado com sucesso!' });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error('Erro ao atualizar pedido:', error);
+        res.status(500).json({ mensagem: 'Erro ao atualizar pedido.' });
+    } finally {
+        connection.release();
+    }
+};

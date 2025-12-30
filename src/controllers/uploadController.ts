@@ -15,9 +15,9 @@ const uploadFromBuffer = (buffer: Buffer, folder: string, filename: string) => {
     return new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
             {
-                folder: folder, // Pasta dentro do Cloudinary
+                folder: folder,      // Pasta dentro do Cloudinary (ex: artes_pedidos)
                 public_id: filename, // Nome do arquivo
-                resource_type: "auto", // Aceita imagem e PDF automaticamente
+                resource_type: "auto", // Detecta se é imagem, pdf ou raw automaticamente
             },
             (error, result) => {
                 if (result) {
@@ -31,50 +31,57 @@ const uploadFromBuffer = (buffer: Buffer, folder: string, filename: string) => {
     });
 };
 
-// 1. UPLOAD
+// 1. UPLOAD (Salva no Cloudinary E no MySQL com o Public ID)
 export const uploadArte = async (req: Request, res: Response) => {
     const { idPedido } = req.params;
-    const arquivo = req.file; // Vem do Multer
+    const arquivo = req.file; // Vem do Multer (middleware de rota)
 
-    if (!arquivo) return res.status(400).json({ mensagem: 'Faltou o arquivo.' });
+    if (!arquivo) return res.status(400).json({ mensagem: 'Nenhum arquivo enviado.' });
 
     try {
-        // Limpa nome para evitar caracteres especiais
+        // Limpa nome para evitar caracteres especiais que quebram URLs
         const nomeLimpo = arquivo.originalname
             .normalize('NFD').replace(/[\u0300-\u036f]/g, "")
-            .replace(/\s+/g, '_').split('.')[0]; // Remove extensão para o ID
+            .replace(/\s+/g, '_').split('.')[0]; // Remove extensão para usar no ID
         
-        // Nome único: pedido_1_timestamp_nome
+        // Nome único para evitar sobrescrita: pedido_1_timestamp_nome
         const nomeUnico = `pedido_${idPedido}_${Date.now()}_${nomeLimpo}`;
 
-        // SOBE PRO CLOUDINARY
+        // --- AÇÃO 1: SOBE PRO CLOUDINARY ---
+        // O result contém tudo que precisamos, inclusive o public_id
         const result: any = await uploadFromBuffer(arquivo.buffer, 'artes_pedidos', nomeUnico);
 
-        // O Cloudinary retorna a URL segura (https)
         const urlFinal = result.secure_url;
+        const publicId = result.public_id; // <--- O "RG" DO ARQUIVO NA NUVEM
 
-        // SALVA NO MYSQL
+        // --- AÇÃO 2: SALVA NO MYSQL ---
+        // Importante: Salvamos o PUBLIC_ID para poder deletar depois
         await pool.query(
-            `INSERT INTO ARQUIVO_PEDIDO (ID_PEDIDO, NOME_ARQUIVO, URL_ARQUIVO, TIPO_ARQUIVO) 
-             VALUES (?, ?, ?, ?)`,
-            [idPedido, arquivo.originalname, urlFinal, arquivo.mimetype]
+            `INSERT INTO ARQUIVO_PEDIDO 
+            (ID_PEDIDO, NOME_ARQUIVO, URL_ARQUIVO, TIPO_ARQUIVO, PUBLIC_ID) 
+            VALUES (?, ?, ?, ?, ?)`,
+            [idPedido, arquivo.originalname, urlFinal, arquivo.mimetype, publicId]
         );
 
-        // Opcional: Atualiza status do pedido
+        // Opcional: Se quiser mudar status do pedido ao subir arte
         /* await pool.query(
             "UPDATE PEDIDO SET STATUS_PEDIDO = 'CRIACAO' WHERE ID_PEDIDO = ? AND STATUS_PEDIDO = 'AGUARDANDO_ARTE'", 
             [idPedido]
-        ); */
+        ); 
+        */
 
-        res.status(201).json({ mensagem: 'Arquivo adicionado!', url: urlFinal });
+        res.status(201).json({ 
+            mensagem: 'Arquivo enviado com sucesso!', 
+            url: urlFinal 
+        });
 
     } catch (error) {
-        console.error('Erro upload Cloudinary:', error);
-        res.status(500).json({ mensagem: 'Erro ao subir arquivo.' });
+        console.error('Erro no upload:', error);
+        res.status(500).json({ mensagem: 'Erro interno ao processar upload.' });
     }
 };
 
-// 2. LISTAR (Igual ao anterior, pois lê do MySQL)
+// 2. LISTAR (Busca do MySQL)
 export const listarArtes = async (req: Request, res: Response) => {
     const { idPedido } = req.params;
     try {
@@ -84,40 +91,46 @@ export const listarArtes = async (req: Request, res: Response) => {
         );
         res.json(rows);
     } catch (error) {
-        res.status(500).json({ mensagem: 'Erro ao listar artes.' });
+        console.error(error);
+        res.status(500).json({ mensagem: 'Erro ao listar arquivos.' });
     }
 };
 
-// 3. DELETAR (Remove do MySQL e do Cloudinary)
+// 3. DELETAR (Remove da Nuvem E do Banco)
 export const deletarArte = async (req: Request, res: Response) => {
     const { idArquivo } = req.params;
 
     try {
-        // Busca URL no banco
-        const [rows]: any = await pool.query('SELECT URL_ARQUIVO FROM ARQUIVO_PEDIDO WHERE ID_ARQUIVO = ?', [idArquivo]);
+        // Passo 1: Busca o PUBLIC_ID no banco antes de deletar
+        const [rows]: any = await pool.query(
+            'SELECT PUBLIC_ID FROM ARQUIVO_PEDIDO WHERE ID_ARQUIVO = ?', 
+            [idArquivo]
+        );
         
-        if (rows.length === 0) return res.status(404).json({ mensagem: 'Arquivo não encontrado.' });
+        if (rows.length === 0) {
+            return res.status(404).json({ mensagem: 'Arquivo não encontrado no sistema.' });
+        }
 
-        const url = rows[0].URL_ARQUIVO;
+        const publicId = rows[0].PUBLIC_ID;
 
-        // EXTRAIR O PUBLIC_ID DO CLOUDINARY PARA DELETAR
-        // URL típica: https://res.cloudinary.com/.../upload/v123/artes_pedidos/nome_arquivo.jpg
-        // Precisamos de: artes_pedidos/nome_arquivo
-        const partesUrl = url.split('/');
-        const nomeArquivoComExtensao = partesUrl[partesUrl.length - 1];
-        const folder = 'artes_pedidos'; // Nome da pasta que definimos no upload
-        const publicId = `${folder}/${nomeArquivoComExtensao.split('.')[0]}`;
+        // Passo 2: Se tiver ID da nuvem, deleta lá primeiro
+        if (publicId) {
+            try {
+                await cloudinary.uploader.destroy(publicId);
+                console.log(`Arquivo removido do Cloudinary: ${publicId}`);
+            } catch (cloudError) {
+                console.error('Erro ao deletar do Cloudinary (mas vou deletar do banco):', cloudError);
+                // Não damos return aqui, pois queremos limpar do banco mesmo se a nuvem falhar
+            }
+        }
 
-        // Deleta no Cloudinary
-        await cloudinary.uploader.destroy(publicId);
-
-        // Deleta no Banco
+        // Passo 3: Deleta o registro do banco de dados
         await pool.query('DELETE FROM ARQUIVO_PEDIDO WHERE ID_ARQUIVO = ?', [idArquivo]);
 
-        res.json({ mensagem: 'Arquivo removido com sucesso.' });
+        res.json({ mensagem: 'Arquivo excluído permanentemente.' });
 
     } catch (error) {
-        console.error('Erro ao deletar:', error);
-        res.status(500).json({ mensagem: 'Erro ao excluir.' });
+        console.error('Erro crítico ao deletar:', error);
+        res.status(500).json({ mensagem: 'Erro ao processar exclusão.' });
     }
 };
