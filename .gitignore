@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env
 env
+api_key_shopee.txt

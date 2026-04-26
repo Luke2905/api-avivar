@@ -1,13 +1,11 @@
-// src/routes/produtoRoutes.ts
 import { Router } from 'express';
-import { listarProdutos, criarProduto } from '../controllers/produtoController';
-import { protegerRota } from '../middlewares/authMiddleware'; // <--- Importe o Porteiro
+import { listarProdutos, criarProduto, excluirProduto } from '../controllers/produtoController';
+import { autorizarPerfis, protegerRota } from '../middlewares/authMiddleware';
 
 const router = Router();
 
-// Agora as rotas estão protegidas!
-// O 'protegerRota' vem antes da função do controller.
-router.get('/', protegerRota, listarProdutos); 
-router.post('/', protegerRota, criarProduto);
+router.get('/', protegerRota, autorizarPerfis('ADMIN', 'FINANCEIRO', 'ARTES', 'PRODUCAO'), listarProdutos);
+router.post('/', protegerRota, autorizarPerfis('ADMIN', 'FINANCEIRO'), criarProduto);
+router.delete('/:id', protegerRota, autorizarPerfis('ADMIN', 'FINANCEIRO'), excluirProduto);
 
 export default router;

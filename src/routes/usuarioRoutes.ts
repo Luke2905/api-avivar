@@ -1,19 +1,17 @@
-// src/routes/usuarioRoutes.ts
 import { Router } from 'express';
-import { 
-    listarUsuarios, 
-    criarUsuario, 
-    atualizarUsuario, 
-    deletarUsuario 
+import {
+  listarUsuarios,
+  criarUsuario,
+  atualizarUsuario,
+  deletarUsuario
 } from '../controllers/usuarioController';
+import { autorizarPerfis, protegerRota } from '../middlewares/authMiddleware';
 
 const router = Router();
 
-// Rota: /api/usuarios
-
-router.get('/', listarUsuarios);        // Lista todos
-router.post('/', criarUsuario);         // Cria um novo (substitui o antigo /registro)
-router.put('/:id', atualizarUsuario);   // Edita pelo ID
-router.delete('/:id', deletarUsuario);  // Deleta pelo ID
+router.get('/', protegerRota, autorizarPerfis('ADMIN'), listarUsuarios);
+router.post('/', protegerRota, autorizarPerfis('ADMIN'), criarUsuario);
+router.put('/:id', protegerRota, autorizarPerfis('ADMIN'), atualizarUsuario);
+router.delete('/:id', protegerRota, autorizarPerfis('ADMIN'), deletarUsuario);
 
 export default router;
