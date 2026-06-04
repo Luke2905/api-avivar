@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from 'axios';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import pool from '../config/database';
 
 interface ShopeeCredentials {
     partnerId: number;
@@ -113,15 +114,29 @@ function parsePartnerKeyFromFile(filePath: string): string | undefined {
     return undefined;
 }
 
-function carregarCredenciaisShopee(): ShopeeCredentials {
-    const partnerId = Number(process.env.SHOPEE_PARTNER_ID);
-    const shopId = Number(process.env.SHOPEE_SHOP_ID);
-    const accessToken = String(process.env.SHOPEE_ACCESS_TOKEN || '').trim();
+async function carregarCredenciaisShopee(): Promise<ShopeeCredentials> {
+    let cfg: any = {};
+    try {
+        const [rows]: any = await pool.query('SELECT * FROM CONFIGURACAO_SHOPEE WHERE ID = 1');
+        if (rows && rows.length > 0) {
+            cfg = rows[0];
+        }
+    } catch (error) {
+        console.warn('Não foi possível ler as configurações da Shopee do banco de dados. Usando .env de fallback.', error);
+    }
+
+    const partnerIdVal = cfg.PARTNER_ID || process.env.SHOPEE_PARTNER_ID;
+    const partnerId = Number(partnerIdVal);
+
+    const shopIdVal = cfg.SHOP_ID || process.env.SHOPEE_SHOP_ID;
+    const shopId = Number(shopIdVal);
+
+    const accessToken = String(cfg.ACCESS_TOKEN || process.env.SHOPEE_ACCESS_TOKEN || '').trim();
     const partnerKeyFile = process.env.SHOPEE_API_KEY_FILE || path.resolve(process.cwd(), 'api_key_shopee.txt');
     const partnerKeyFromFile = parsePartnerKeyFromFile(partnerKeyFile);
     const partnerKeyFromEnv = String(process.env.SHOPEE_PARTNER_KEY || process.env.TEST_API_PARTNER_KEY || '').trim();
-    const partnerKey = partnerKeyFromEnv || String(partnerKeyFromFile || '').trim();
-    const baseUrl = (process.env.SHOPEE_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, '');
+    const partnerKey = String(cfg.PARTNER_KEY || '').trim() || partnerKeyFromEnv || String(partnerKeyFromFile || '').trim();
+    const baseUrl = (cfg.SHOPEE_HOST || process.env.SHOPEE_HOST || DEFAULT_BASE_URL).replace(/\/$/, '');
 
     const faltantes: string[] = [];
 
@@ -210,8 +225,8 @@ class ShopeeService {
     private readonly credentials: ShopeeCredentials;
     private readonly client: AxiosInstance;
 
-    constructor() {
-        this.credentials = carregarCredenciaisShopee();
+    constructor(credentials: ShopeeCredentials) {
+        this.credentials = credentials;
         this.client = axios.create({
             baseURL: this.credentials.baseUrl,
             timeout: 30000
@@ -382,6 +397,7 @@ class ShopeeService {
 }
 
 export async function buscarPedidosShopee(params: BuscarPedidosShopeeParams) {
-    const service = new ShopeeService();
+    const credentials = await carregarCredenciaisShopee();
+    const service = new ShopeeService(credentials);
     return service.buscarPedidos(params);
 }

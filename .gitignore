@@ -1,5 +1,6 @@
 node_modules/
 dist/
 .env
+.env.*
 env
 api_key_shopee.txt
