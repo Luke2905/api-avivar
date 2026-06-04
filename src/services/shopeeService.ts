@@ -131,12 +131,70 @@ async function carregarCredenciaisShopee(): Promise<ShopeeCredentials> {
     const shopIdVal = cfg.SHOP_ID || process.env.SHOPEE_SHOP_ID;
     const shopId = Number(shopIdVal);
 
-    const accessToken = String(cfg.ACCESS_TOKEN || process.env.SHOPEE_ACCESS_TOKEN || '').trim();
     const partnerKeyFile = process.env.SHOPEE_API_KEY_FILE || path.resolve(process.cwd(), 'api_key_shopee.txt');
     const partnerKeyFromFile = parsePartnerKeyFromFile(partnerKeyFile);
     const partnerKeyFromEnv = String(process.env.SHOPEE_PARTNER_KEY || process.env.TEST_API_PARTNER_KEY || '').trim();
     const partnerKey = String(cfg.PARTNER_KEY || '').trim() || partnerKeyFromEnv || String(partnerKeyFromFile || '').trim();
     const baseUrl = (cfg.SHOPEE_HOST || process.env.SHOPEE_HOST || DEFAULT_BASE_URL).replace(/\/$/, '');
+
+    let accessToken = String(cfg.ACCESS_TOKEN || process.env.SHOPEE_ACCESS_TOKEN || '').trim();
+    let refreshToken = String(cfg.REFRESH_TOKEN || process.env.SHOPEE_REFRESH_TOKEN || '').trim();
+
+    // Auto-refresh token if expired (4 hours lifetime)
+    if (cfg.UPDATED_AT && accessToken && refreshToken && partnerId && partnerKey && shopId) {
+        const updatedAtTime = new Date(cfg.UPDATED_AT).getTime();
+        const expireInMs = (cfg.TOKEN_EXPIRE_IN || 14400) * 1000;
+        const isExpired = Date.now() > (updatedAtTime + expireInMs - 10 * 60 * 1000); // 10 minutes safety margin
+
+        if (isExpired) {
+            try {
+                console.log("[Shopee] Access token expirado/próximo de expirar. Tentando fazer refresh...");
+                const pathApi = '/api/v2/auth/access_token/get';
+                const timestamp = Math.floor(Date.now() / 1000);
+                const baseString = `${partnerId}${pathApi}${timestamp}`;
+                const sign = crypto.createHmac('sha256', partnerKey).update(baseString).digest('hex');
+
+                const refreshResponse = await axios.post(
+                    `${baseUrl}${pathApi}`,
+                    {
+                        refresh_token: refreshToken,
+                        partner_id: partnerId,
+                        shop_id: shopId
+                    },
+                    {
+                        params: {
+                            partner_id: partnerId,
+                            timestamp,
+                            sign
+                        },
+                        timeout: 30000
+                    }
+                );
+
+                if (refreshResponse.data?.error) {
+                    console.error("[Shopee] Erro no refresh token da Shopee:", refreshResponse.data.error, refreshResponse.data.message);
+                } else {
+                    const newAccessToken = String(refreshResponse.data?.access_token || refreshResponse.data?.response?.access_token || '');
+                    const newRefreshToken = String(refreshResponse.data?.refresh_token || refreshResponse.data?.response?.refresh_token || '');
+                    const newExpireIn = Number(refreshResponse.data?.expire_in || refreshResponse.data?.response?.expire_in || 14400);
+
+                    if (newAccessToken) {
+                        await pool.query(`
+                            UPDATE CONFIGURACAO_SHOPEE SET
+                                ACCESS_TOKEN = ?, REFRESH_TOKEN = ?, TOKEN_EXPIRE_IN = ?, UPDATED_AT = NOW()
+                            WHERE ID = 1
+                        `, [newAccessToken, newRefreshToken, newExpireIn]);
+                        
+                        console.log("[Shopee] Access token atualizado com sucesso!");
+                        accessToken = newAccessToken;
+                        refreshToken = newRefreshToken;
+                    }
+                }
+            } catch (refreshErr) {
+                console.error("[Shopee] Falha ao tentar atualizar o token da Shopee:", refreshErr);
+            }
+        }
+    }
 
     const faltantes: string[] = [];
 
