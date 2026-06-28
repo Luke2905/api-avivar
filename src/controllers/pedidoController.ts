@@ -20,7 +20,8 @@ export const listarPedidos = async (req: Request, res: Response) => {
             numero,
             status,
             data_inicio,
-            data_fim
+            data_fim,
+            prazo_envio
         } = req.query as Record<string, string | undefined>;
 
         const filtros: string[] = [];
@@ -64,6 +65,11 @@ export const listarPedidos = async (req: Request, res: Response) => {
         if (status) {
             filtros.push('p.STATUS_PEDIDO = ?');
             params.push(status);
+        }
+
+        if (prazo_envio) {
+            filtros.push('DATE(p.PRAZO_ENVIO) = ?');
+            params.push(prazo_envio);
         }
 
         const whereClause = filtros.length > 0 ? `WHERE ${filtros.join(' AND ')}` : '';
@@ -134,7 +140,7 @@ export const obterDetalhesPedido = async (req: Request, res: Response) => {
 
 // POST: Criar Pedido COM ITENS (Transação no Banco)
 export const criarPedido = async (req: Request, res: Response) => {
-    const { nome_cliente, num_pedido, plataforma, itens, prazo_envio, link_arte } = req.body; 
+    const { nome_cliente, num_pedido, plataforma, itens, prazo_envio, link_arte, observacoes } = req.body; 
     // 'itens' deve ser um array: [{ id_produto, quantidade, valor_unitario }]
 
     const connection = await pool.getConnection(); // Pega conexão exclusiva para transação
@@ -147,9 +153,9 @@ export const criarPedido = async (req: Request, res: Response) => {
 
         // 2. Insere o Pedido (Cabeçalho)
         const [result]: any = await connection.query(`
-            INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO)
-            VALUES (?, ?, ?, ?, NOW(), 'ENTRADA')
-        `, [nome_cliente, num_pedido, plataforma, total, prazo_envio || null, link_arte || null]);
+            INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO, PRAZO_ENVIO, LINK_ARTE, OBSERVACOES)
+            VALUES (?, ?, ?, ?, NOW(), 'ENTRADA', ?, ?, ?)
+        `, [nome_cliente, num_pedido, plataforma, total, prazo_envio || null, link_arte || null, observacoes || null]);
 
         const novoIdPedido = result.insertId;
 
@@ -342,7 +348,7 @@ export const atualizarNotaFiscal = async (req: Request, res: Response) => {
 
 export const atualizarPedido = async (req: Request, res: Response) => {
     const { id } = req.params;
-    const { nome_cliente, num_pedido, plataforma, valor_total, itens, prazo_envio, link_arte } = req.body;
+    const { nome_cliente, num_pedido, plataforma, valor_total, itens, prazo_envio, link_arte, observacoes } = req.body;
     // 'itens' espera um array: [{ id_produto, quantidade, valor_unitario }]
 
     const connection = await pool.getConnection();
@@ -356,9 +362,12 @@ export const atualizarPedido = async (req: Request, res: Response) => {
             SET NOME_CLIENTE = ?, 
                 NUM_PEDIDO_PLATAFORMA = ?, 
                 PLATAFORMA_ORIGEM = ?, 
-                VALOR_TOTAL = ?
+                VALOR_TOTAL = ?,
+                PRAZO_ENVIO = ?,
+                LINK_ARTE = ?,
+                OBSERVACOES = ?
             WHERE ID_PEDIDO = ?
-        `, [nome_cliente, num_pedido, plataforma, valor_total, prazo_envio || null, link_arte || null, id]);
+        `, [nome_cliente, num_pedido, plataforma, valor_total, prazo_envio || null, link_arte || null, observacoes || null, id]);
 
         // 2. Atualiza os ITENS (Estratégia: Remove tudo e insere de novo)
         // Essa é a estratégia mais segura e simples para garantir que a lista fique igual ao front
@@ -485,13 +494,14 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
             }
 
             const [insertPedido]: any = await connection.query(
-                `INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO)
-                 VALUES (?, ?, 'Shopee', ?, ?, 'ENTRADA')`,
+                `INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO, OBSERVACOES)
+                 VALUES (?, ?, 'Shopee', ?, ?, 'ENTRADA', ?)`,
                 [
                     pedidoShopee.nomeCliente,
                     pedidoShopee.orderSn,
                     pedidoShopee.valorTotal,
-                    pedidoShopee.dataPedido
+                    pedidoShopee.dataPedido,
+                    pedidoShopee.observacoes || null
                 ]
             );
 

@@ -5,7 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import pool from '../config/database';
 import { registrarLog } from '../services/logService';
-import { buscarPedidosShopee } from '../services/shopeeService';
+import { buscarPedidosShopee, buscarCatalogoShopee } from '../services/shopeeService';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -329,5 +329,75 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
     } catch (error: any) {
         console.error('Erro ao sincronizar Shopee:', error);
         res.status(500).json({ mensagem: String(error?.message || 'Erro ao sincronizar pedidos da Shopee') });
+    }
+};
+
+/** POST /api/shopee/sincronizar-produtos — Sincroniza catálogo de produtos da Shopee → Banco */
+export const sincronizarCatalogoShopee = async (req: Request, res: Response) => {
+    try {
+        const cfg = await getShopeeConfigFromDB();
+
+        if (!cfg.integracaoAtiva) {
+            return res.status(400).json({
+                mensagem: 'A integração com a Shopee está desativada. Ative nas configurações.',
+                codigo: 'INTEGRACAO_DESATIVADA'
+            });
+        }
+        if (!cfg.accessToken || !cfg.shopId || !cfg.partnerId || !cfg.partnerKey) {
+            return res.status(400).json({
+                mensagem: 'Integração não autorizada. Complete a configuração e autorize a loja primeiro.',
+                codigo: 'SEM_TOKEN'
+            });
+        }
+
+        const produtosShopee = await buscarCatalogoShopee();
+
+        let criados = 0;
+        let ignorados = 0;
+        const connection = await pool.getConnection();
+
+        try {
+            await connection.beginTransaction();
+
+            for (const prod of produtosShopee) {
+                const skuLimpo = prod.sku.toUpperCase();
+                
+                const [existe]: any = await connection.query(
+                    'SELECT ID_PRODUTO FROM PRODUTO WHERE UPPER(TRIM(SKU_PRODUTO)) = ?',
+                    [skuLimpo]
+                );
+
+                if (existe.length > 0) {
+                    ignorados++;
+                    continue;
+                }
+
+                await connection.query(
+                    `INSERT INTO PRODUTO (SKU_PRODUTO, NOME_PRODUTO, PRECO_VENDA, ID_CATEGORIA, IMPOSTO_PERCENTUAL, MAO_DE_OBRA_VALOR)
+                     VALUES (?, ?, ?, NULL, 0, 0)`,
+                    [skuLimpo, prod.nome, prod.preco]
+                );
+                
+                criados++;
+            }
+
+            await connection.commit();
+        } catch (dbError) {
+            await connection.rollback();
+            throw dbError;
+        } finally {
+            connection.release();
+        }
+
+        await registrarLog('ADMIN', 'SHOPEE_SINCRONIZACAO_PRODUTOS', `Sincronização de catálogo concluída: ${criados} criados, ${ignorados} já existiam.`);
+        res.json({
+            mensagem: `Catálogo sincronizado com sucesso!`,
+            criados,
+            ignorados,
+            total: produtosShopee.length
+        });
+    } catch (error: any) {
+        console.error('Erro ao sincronizar catálogo da Shopee:', error);
+        res.status(500).json({ mensagem: String(error?.message || 'Erro ao sincronizar catálogo da Shopee') });
     }
 };

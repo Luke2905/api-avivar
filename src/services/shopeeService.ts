@@ -57,6 +57,7 @@ interface ShopeeRawOrder {
     total_amount?: number;
     create_time?: number;
     item_list?: ShopeeRawOrderItem[];
+    message_to_seller?: string;
 }
 
 export interface ShopeeOrderItem {
@@ -72,6 +73,7 @@ export interface ShopeeOrder {
     valorTotal: number;
     dataPedido: Date;
     itens: ShopeeOrderItem[];
+    observacoes?: string;
 }
 
 export interface BuscarPedidosShopeeParams {
@@ -79,6 +81,59 @@ export interface BuscarPedidosShopeeParams {
     timeTo: number;
     orderStatus?: string;
 }
+
+interface ShopeeItemListResponse {
+    error?: string;
+    message?: string;
+    response?: {
+        item?: { item_id: number; item_status: string }[];
+        total_count?: number;
+        has_next_page?: boolean;
+        next_offset?: number;
+    };
+}
+
+interface ShopeeItemBaseInfoResponse {
+    error?: string;
+    message?: string;
+    response?: {
+        item_list?: {
+            item_id: number;
+            item_sku: string;
+            item_name: string;
+            has_model: boolean;
+            price_info?: { original_price: number }[];
+        }[];
+    };
+}
+
+interface TierVariation {
+    name: string;
+    option_list: { option: string }[];
+}
+
+interface ShopeeModel {
+    model_id: number;
+    model_sku: string;
+    tier_index?: number[];
+    price_info?: { original_price: number }[];
+}
+
+interface ShopeeModelListResponse {
+    error?: string;
+    message?: string;
+    response?: {
+        tier_variation?: TierVariation[];
+        model?: ShopeeModel[];
+    };
+}
+
+export interface ShopeeProdutoMapeado {
+    sku: string;
+    nome: string;
+    preco: number;
+}
+
 
 const DEFAULT_BASE_URL = 'https://partner.shopeemobile.com';
 const ORDER_LIST_PATH = '/api/v2/order/get_order_list';
@@ -267,7 +322,8 @@ function mapearPedidoShopee(rawOrder: ShopeeRawOrder): ShopeeOrder {
         nomeCliente,
         valorTotal,
         dataPedido: new Date(createTime * 1000),
-        itens
+        itens,
+        observacoes: rawOrder.message_to_seller || ''
     };
 }
 
@@ -402,7 +458,7 @@ class ShopeeService {
 
         for (const lote of lotes) {
             const timestamp = await this.obterTimestampShopee();
-            const responseOptionalFields = 'item_list,total_amount,buyer_username,recipient_address,create_time';
+            const responseOptionalFields = 'item_list,total_amount,buyer_username,recipient_address,create_time,message_to_seller';
             const authParams = this.authParams(ORDER_DETAIL_PATH, timestamp);
 
             const response = await this.client.get<ShopeeOrderDetailResponse>(
@@ -433,10 +489,143 @@ class ShopeeService {
             .filter((order) => Boolean(order.order_sn))
             .map(mapearPedidoShopee);
     }
+
+    private async buscarItensList() {
+        const itemIds: number[] = [];
+        let offset = 0;
+        let hasNext = true;
+
+        while (hasNext) {
+            const timestamp = await this.obterTimestampShopee();
+            const queryParams: Record<string, string | number> = {
+                ...this.authParams('/api/v2/product/get_item_list', timestamp),
+                offset,
+                page_size: 50,
+                item_status: 'NORMAL'
+            };
+
+            const response = await this.client.get<ShopeeItemListResponse>('/api/v2/product/get_item_list', {
+                params: queryParams
+            });
+
+            if (response.data.error) {
+                throw new Error(`Erro Shopee (get_item_list): ${response.data.error} - ${response.data.message}`);
+            }
+
+            const items = response.data.response?.item || [];
+            itemIds.push(...items.map(i => i.item_id));
+
+            hasNext = Boolean(response.data.response?.has_next_page);
+            offset = response.data.response?.next_offset || (offset + 50);
+
+            if (!hasNext || items.length === 0) break;
+        }
+
+        return Array.from(new Set(itemIds));
+    }
+
+    private async buscarItemBaseInfo(itemIds: number[]) {
+        if (itemIds.length === 0) return [];
+        const detalhes = [];
+        const lotes = dividirEmLotes(itemIds, 50);
+
+        for (const lote of lotes) {
+            const timestamp = await this.obterTimestampShopee();
+            const response = await this.client.get<ShopeeItemBaseInfoResponse>('/api/v2/product/get_item_base_info', {
+                params: {
+                    ...this.authParams('/api/v2/product/get_item_base_info', timestamp),
+                    item_id_list: lote.join(',')
+                }
+            });
+
+            if (response.data.error) {
+                throw new Error(`Erro Shopee (get_item_base_info): ${response.data.error} - ${response.data.message}`);
+            }
+
+            detalhes.push(...(response.data.response?.item_list || []));
+        }
+        return detalhes;
+    }
+
+    private async buscarModelList(itemId: number) {
+        const timestamp = await this.obterTimestampShopee();
+        const response = await this.client.get<ShopeeModelListResponse>('/api/v2/product/get_model_list', {
+            params: {
+                ...this.authParams('/api/v2/product/get_model_list', timestamp),
+                item_id: itemId
+            }
+        });
+
+        if (response.data.error) {
+            console.warn(`Erro ao buscar modelos do item ${itemId}: ${response.data.message}`);
+            return null;
+        }
+
+        return response.data.response;
+    }
+
+    async sincronizarCatalogo(): Promise<ShopeeProdutoMapeado[]> {
+        const itemIds = await this.buscarItensList();
+        const baseInfos = await this.buscarItemBaseInfo(itemIds);
+
+        const produtos: ShopeeProdutoMapeado[] = [];
+
+        for (const info of baseInfos) {
+            if (!info.has_model) {
+                if (info.item_sku) {
+                    produtos.push({
+                        sku: String(info.item_sku).trim(),
+                        nome: String(info.item_name).trim(),
+                        preco: toNumber(info.price_info?.[0]?.original_price, 0)
+                    });
+                }
+            } else {
+                const modelInfo = await this.buscarModelList(info.item_id);
+                if (modelInfo && modelInfo.model) {
+                    for (const model of modelInfo.model) {
+                        if (!model.model_sku) continue;
+                        
+                        let nomeVariacao = '';
+                        if (model.tier_index && modelInfo.tier_variation) {
+                            const opcoes = model.tier_index.map((idx, tierLevel) => {
+                                const tier = modelInfo.tier_variation?.[tierLevel];
+                                return tier?.option_list?.[idx]?.option || '';
+                            }).filter(Boolean);
+                            if (opcoes.length > 0) {
+                                nomeVariacao = ` - ${opcoes.join(' ')}`;
+                            }
+                        }
+
+                        produtos.push({
+                            sku: String(model.model_sku).trim(),
+                            nome: `${String(info.item_name).trim()}${nomeVariacao}`.substring(0, 200),
+                            preco: toNumber(model.price_info?.[0]?.original_price, 0)
+                        });
+                    }
+                }
+            }
+        }
+
+        // Filtra duplicatas ou sem SKU
+        const unicos = new Map<string, ShopeeProdutoMapeado>();
+        for (const p of produtos) {
+            if (p.sku && !unicos.has(p.sku.toUpperCase())) {
+                unicos.set(p.sku.toUpperCase(), p);
+            }
+        }
+
+        return Array.from(unicos.values());
+    }
 }
 
 export async function buscarPedidosShopee(params: BuscarPedidosShopeeParams) {
     const credentials = await carregarCredenciaisShopee();
     const service = new ShopeeService(credentials);
     return service.buscarPedidos(params);
+}
+
+export async function buscarCatalogoShopee() {
+    const credentials = await carregarCredenciaisShopee();
+    const service = new ShopeeService(credentials);
+    return service.sincronizarCatalogo();
 }
