@@ -63,6 +63,13 @@ async function obterTimestampShopee(shopeeHost: string) {
     return Math.floor(Date.now() / 1000);
 }
 
+async function obterCategoriaPadrao(connection: any) {
+    const [rows]: any = await connection.query("SELECT ID_CATEGORIA FROM CATEGORIA WHERE NOME_CATEGORIA = 'Importados Shopee'");
+    if (rows.length > 0) return rows[0].ID_CATEGORIA;
+    const [result]: any = await connection.query("INSERT INTO CATEGORIA (NOME_CATEGORIA) VALUES ('Importados Shopee')");
+    return result.insertId;
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 /** GET /api/shopee/status — Status da integração */
@@ -289,12 +296,13 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
                     let idProduto = prodRows[0]?.ID_PRODUTO || null;
                     
                     if (!idProduto) {
+                        const idCategoria = await obterCategoriaPadrao(connection);
                         const nomeProduto = String(item.nome || `Produto Shopee ${skuLimpo}`).trim().substring(0, 200);
                         const preco = item.valorUnitario || 0;
                         const [insertProd]: any = await connection.query(
                             `INSERT INTO PRODUTO (SKU_PRODUTO, NOME_PRODUTO, PRECO_VENDA, ID_CATEGORIA, IMPOSTO_PERCENTUAL, MAO_DE_OBRA_VALOR)
-                             VALUES (?, ?, ?, NULL, 0, 0)`,
-                            [skuLimpo, nomeProduto, preco]
+                             VALUES (?, ?, ?, ?, 0, 0)`,
+                            [skuLimpo, nomeProduto, preco, idCategoria]
                         );
                         idProduto = insertProd.insertId;
                     }
@@ -372,10 +380,12 @@ export const sincronizarCatalogoShopee = async (req: Request, res: Response) => 
                     continue;
                 }
 
+                const idCategoria = await obterCategoriaPadrao(connection);
+
                 await connection.query(
                     `INSERT INTO PRODUTO (SKU_PRODUTO, NOME_PRODUTO, PRECO_VENDA, ID_CATEGORIA, IMPOSTO_PERCENTUAL, MAO_DE_OBRA_VALOR)
-                     VALUES (?, ?, ?, NULL, 0, 0)`,
-                    [skuLimpo, prod.nome, prod.preco]
+                     VALUES (?, ?, ?, ?, 0, 0)`,
+                    [skuLimpo, prod.nome, prod.preco, idCategoria]
                 );
                 
                 criados++;
