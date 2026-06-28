@@ -21,7 +21,7 @@ interface ShopeeOrderListResponse {
     message?: string;
     response?: {
         more?: boolean;
-        cursor?: string;
+        next_cursor?: string;
         order_list?: ShopeeOrderListItem[];
     };
 }
@@ -362,7 +362,7 @@ class ShopeeService {
             const orders = response.data.response?.order_list || [];
             orderSns.push(...orders.map((order) => order.order_sn));
             more = Boolean(response.data.response?.more);
-            cursor = response.data.response?.cursor || '';
+            cursor = response.data.response?.next_cursor || '';
 
             if (!more) {
                 break;
@@ -405,41 +405,22 @@ class ShopeeService {
             const responseOptionalFields = 'item_list,total_amount,buyer_username,recipient_address,create_time';
             const authParams = this.authParams(ORDER_DETAIL_PATH, timestamp);
 
-            try {
-                const response = await this.client.post<ShopeeOrderDetailResponse>(
-                    ORDER_DETAIL_PATH,
-                    {
-                        order_sn_list: lote,
+            const response = await this.client.get<ShopeeOrderDetailResponse>(
+                ORDER_DETAIL_PATH,
+                {
+                    params: {
+                        ...authParams,
+                        order_sn_list: lote.join(','),
                         response_optional_fields: responseOptionalFields
-                    },
-                    {
-                        params: authParams
                     }
-                );
-
-                if (response.data.error) {
-                    throw new Error(`Erro Shopee (detalhes): ${response.data.error} - ${response.data.message || 'sem detalhes'}`);
                 }
+            );
 
-                detalhes.push(...(response.data.response?.order_list || []));
-            } catch (postError: any) {
-                const fallbackResponse = await this.client.get<ShopeeOrderDetailResponse>(
-                    ORDER_DETAIL_PATH,
-                    {
-                        params: {
-                            ...authParams,
-                            order_sn_list: lote.join(','),
-                            response_optional_fields: responseOptionalFields
-                        }
-                    }
-                );
-
-                if (fallbackResponse.data.error) {
-                    throw new Error(`Erro Shopee (detalhes): ${fallbackResponse.data.error} - ${fallbackResponse.data.message || 'sem detalhes'}`);
-                }
-
-                detalhes.push(...(fallbackResponse.data.response?.order_list || []));
+            if (response.data.error) {
+                throw new Error(`Erro Shopee (detalhes): ${response.data.error} - ${response.data.message || 'sem detalhes'}`);
             }
+
+            detalhes.push(...(response.data.response?.order_list || []));
         }
 
         return detalhes;
