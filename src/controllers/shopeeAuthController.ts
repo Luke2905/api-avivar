@@ -286,7 +286,19 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
                     const [prodRows]: any = await connection.query(
                         'SELECT ID_PRODUTO FROM PRODUTO WHERE UPPER(TRIM(SKU_PRODUTO)) = ?', [skuLimpo]
                     );
-                    const idProduto = prodRows[0]?.ID_PRODUTO || null;
+                    let idProduto = prodRows[0]?.ID_PRODUTO || null;
+                    
+                    if (!idProduto) {
+                        const nomeProduto = String(item.nome || `Produto Shopee ${skuLimpo}`).trim().substring(0, 200);
+                        const preco = item.valorUnitario || 0;
+                        const [insertProd]: any = await connection.query(
+                            `INSERT INTO PRODUTO (SKU_PRODUTO, NOME_PRODUTO, PRECO_VENDA, ID_CATEGORIA, IMPOSTO_PERCENTUAL, MAO_DE_OBRA_VALOR)
+                             VALUES (?, ?, ?, NULL, 0, 0)`,
+                            [skuLimpo, nomeProduto, preco]
+                        );
+                        idProduto = insertProd.insertId;
+                    }
+
                     if (idProduto) {
                         await connection.query(`
                             INSERT INTO ITEM_PEDIDO (ID_PEDIDO, ID_PRODUTO, QUANTIDADE, VALOR_UNITARIO)
