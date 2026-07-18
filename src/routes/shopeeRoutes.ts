@@ -6,7 +6,9 @@ import {
     callbackShopee, 
     trocarCodePorToken,
     sincronizarPedidosShopee,
-    sincronizarCatalogoShopee
+    sincronizarCatalogoShopee,
+    verificarEnviadosShopee,
+    obterHistoricoSync
 } from '../controllers/shopeeAuthController';
 import { autorizarPerfis, protegerRota } from '../middlewares/authMiddleware';
 
@@ -23,6 +25,8 @@ router.post('/token', protegerRota, autorizarPerfis('ADMIN'), trocarCodePorToken
 
 // Sincronização
 router.post('/sincronizar', protegerRota, autorizarPerfis('ADMIN'), sincronizarPedidosShopee);
+router.get('/historico', protegerRota, autorizarPerfis('ADMIN'), obterHistoricoSync);
 router.post('/sincronizar-produtos', protegerRota, autorizarPerfis('ADMIN'), sincronizarCatalogoShopee);
+router.post('/verificar-enviados', protegerRota, autorizarPerfis('ADMIN'), verificarEnviadosShopee);
 
 export default router;

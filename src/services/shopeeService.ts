@@ -48,6 +48,12 @@ interface ShopeeRawOrderItem {
     model_name?: string;
 }
 
+interface ShopeePackage {
+    package_number?: string;
+    logistics_status?: string;
+    tracking_number?: string;
+}
+
 interface ShopeeRawOrder {
     order_sn: string;
     buyer_username?: string;
@@ -55,9 +61,13 @@ interface ShopeeRawOrder {
         name?: string;
     };
     total_amount?: number;
+    actual_shipping_fee?: number;
+    estimated_shipping_fee?: number;
     create_time?: number;
+    ship_by_date?: number;
     item_list?: ShopeeRawOrderItem[];
     message_to_seller?: string;
+    package_list?: ShopeePackage[];
 }
 
 export interface ShopeeOrderItem {
@@ -71,7 +81,10 @@ export interface ShopeeOrder {
     orderSn: string;
     nomeCliente: string;
     valorTotal: number;
+    valorRepasse: number;
+    trackingNumber: string;
     dataPedido: Date;
+    prazoEnvio?: Date | null;
     itens: ShopeeOrderItem[];
     observacoes?: string;
 }
@@ -312,7 +325,16 @@ function mapearPedidoShopee(rawOrder: ShopeeRawOrder): ShopeeOrder {
 
     const totalItens = itens.reduce((acc, item) => acc + (item.quantidade * item.valorUnitario), 0);
     const valorTotal = Math.max(0, toNumber(rawOrder.total_amount, totalItens));
+    // Valor de repasse = total - frete do vendedor (estimativa disponível na API)
+    const freteVendedor = toNumber(rawOrder.actual_shipping_fee ?? rawOrder.estimated_shipping_fee, 0);
+    const valorRepasse = Math.max(0, valorTotal - freteVendedor);
+
+    // Tracking number — extraído do primeiro pacote da lista
+    const primeiroPackage = (rawOrder.package_list || [])[0];
+    const trackingNumber = String(primeiroPackage?.tracking_number || '').trim();
+
     const createTime = toNumber(rawOrder.create_time, Math.floor(Date.now() / 1000));
+    const shipByDate = rawOrder.ship_by_date ? new Date(rawOrder.ship_by_date * 1000) : null;
     const nomeCliente = String(
         rawOrder.buyer_username || rawOrder.recipient_address?.name || 'Cliente Shopee'
     ).trim() || 'Cliente Shopee';
@@ -321,7 +343,10 @@ function mapearPedidoShopee(rawOrder: ShopeeRawOrder): ShopeeOrder {
         orderSn: rawOrder.order_sn,
         nomeCliente,
         valorTotal,
+        valorRepasse,
+        trackingNumber,
         dataPedido: new Date(createTime * 1000),
+        prazoEnvio: shipByDate,
         itens,
         observacoes: rawOrder.message_to_seller || ''
     };
@@ -458,7 +483,7 @@ class ShopeeService {
 
         for (const lote of lotes) {
             const timestamp = await this.obterTimestampShopee();
-            const responseOptionalFields = 'item_list,total_amount,buyer_username,recipient_address,create_time,message_to_seller';
+            const responseOptionalFields = 'item_list,total_amount,buyer_username,recipient_address,create_time,message_to_seller,ship_by_date,actual_shipping_fee,package_list';
             const authParams = this.authParams(ORDER_DETAIL_PATH, timestamp);
 
             const response = await this.client.get<ShopeeOrderDetailResponse>(

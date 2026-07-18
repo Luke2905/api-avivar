@@ -239,108 +239,228 @@ export const trocarCodePorToken = async (req: Request, res: Response) => {
 };
 
 /** POST /api/shopee/sincronizar — Sincroniza pedidos da Shopee → Banco */
+function converterDataParaUnixSegundos(valor: string) {
+    const timestamp = Math.floor(new Date(valor).getTime() / 1000);
+    return Number.isFinite(timestamp) ? timestamp : NaN;
+}
+
 export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
+    const {
+        dias = 7,
+        data_inicio,
+        data_fim,
+        status,
+    } = req.body || {};
+
+    let timeFrom: number;
+    let timeTo: number;
+
+    if (data_inicio && data_fim) {
+        timeFrom = converterDataParaUnixSegundos(String(data_inicio));
+        timeTo = converterDataParaUnixSegundos(String(data_fim));
+
+        if (!Number.isFinite(timeFrom) || !Number.isFinite(timeTo)) {
+            return res.status(400).json({
+                mensagem: 'Datas inválidas. Use formato ISO (ex: 2026-04-03T00:00:00Z).'
+            });
+        }
+    } else {
+        const diasNumero = Number(dias);
+        if (!Number.isFinite(diasNumero) || diasNumero <= 0) {
+            return res.status(400).json({ mensagem: 'O campo "dias" precisa ser um número maior que zero.' });
+        }
+
+        timeTo = Math.floor(Date.now() / 1000);
+        timeFrom = timeTo - Math.floor(diasNumero * 24 * 60 * 60);
+    }
+
+    if (timeFrom > timeTo) {
+        return res.status(400).json({ mensagem: '"data_inicio" não pode ser maior que "data_fim".' });
+    }
+
+    const connection = await pool.getConnection();
+
     try {
-        const cfg = await getShopeeConfigFromDB();
+        const pedidosShopee = await buscarPedidosShopee({
+            timeFrom,
+            timeTo,
+            orderStatus: status
+        });
 
-        if (!cfg.integracaoAtiva) {
-            return res.status(400).json({
-                mensagem: 'A integração com a Shopee está desativada. Ative nas configurações.',
-                codigo: 'INTEGRACAO_DESATIVADA'
+        if (pedidosShopee.length === 0) {
+            return res.status(200).json({
+                mensagem: 'Nenhum pedido retornado pela Shopee para o período informado.',
+                consultados: 0,
+                criados: 0,
+                itensCriados: 0,
+                duplicados: 0,
+                skusNaoEncontrados: []
             });
         }
-        if (!cfg.accessToken || !cfg.shopId || !cfg.partnerId || !cfg.partnerKey) {
-            return res.status(400).json({
-                mensagem: 'Integração não autorizada. Complete a configuração e autorize a loja primeiro.',
-                codigo: 'SEM_TOKEN'
-            });
+
+        await connection.beginTransaction();
+
+        const [produtosDb]: any = await connection.query('SELECT ID_PRODUTO, SKU_PRODUTO, PRECO_VENDA FROM PRODUTO');
+        const mapaProdutos = new Map<string, { id: number; preco: number }>();
+        produtosDb.forEach((produto: any) => {
+            const sku = String(produto.SKU_PRODUTO || '').trim().toUpperCase();
+            if (sku) {
+                mapaProdutos.set(sku, {
+                    id: produto.ID_PRODUTO,
+                    preco: Number(produto.PRECO_VENDA || 0)
+                });
+            }
+        });
+
+        const orderSns = pedidosShopee.map((pedido) => pedido.orderSn);
+        let setDuplicados = new Set<string>();
+        if (orderSns.length > 0) {
+            const placeholders = orderSns.map(() => '?').join(', ');
+            const [pedidosExistentes]: any = await connection.query(
+                `SELECT NUM_PEDIDO_PLATAFORMA
+                 FROM PEDIDO
+                 WHERE PLATAFORMA_ORIGEM = 'Shopee'
+                 AND NUM_PEDIDO_PLATAFORMA IN (${placeholders})`,
+                orderSns
+            );
+            setDuplicados = new Set<string>(
+                pedidosExistentes.map((pedido: any) => String(pedido.NUM_PEDIDO_PLATAFORMA))
+            );
         }
-
-        // Busca pedidos das últimas 15 dias por padrão (janela segura da API)
-        const diasAtras = Number(req.body.dias || 15);
-        const timeTo = Math.floor(Date.now() / 1000);
-        const timeFrom = timeTo - (diasAtras * 24 * 60 * 60);
-
-        const pedidosShopee = await buscarPedidosShopee({ timeFrom, timeTo, orderStatus: 'READY_TO_SHIP' });
 
         let criados = 0;
-        let ignorados = 0;
-        const connection = await pool.getConnection();
+        let itensCriados = 0;
+        let duplicados = 0;
+        const skusNaoEncontrados = new Set<string>();
 
-        try {
-            await connection.beginTransaction();
-
-            for (const pedido of pedidosShopee) {
-                // Verifica se já existe no banco
-                const [existe]: any = await connection.query(
-                    'SELECT ID_PEDIDO FROM PEDIDO WHERE NUM_PEDIDO_PLATAFORMA = ?',
-                    [pedido.orderSn]
-                );
-                if (existe.length > 0) { ignorados++; continue; }
-
-                // Insere o Pedido
-                const [result]: any = await connection.query(`
-                    INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO)
-                    VALUES (?, ?, 'Shopee', ?, ?, 'ENTRADA')
-                `, [pedido.nomeCliente, pedido.orderSn, pedido.valorTotal, pedido.dataPedido]);
-
-                const novoId = result.insertId;
-
-                // Busca produtos pelo SKU para associar
-                for (const item of pedido.itens) {
-                    const skuLimpo = String(item.sku || '').trim().toUpperCase();
-                    if (!skuLimpo) continue;
-                    const [prodRows]: any = await connection.query(
-                        'SELECT ID_PRODUTO FROM PRODUTO WHERE UPPER(TRIM(SKU_PRODUTO)) = ?', [skuLimpo]
-                    );
-                    let idProduto = prodRows[0]?.ID_PRODUTO || null;
-                    
-                    if (!idProduto) {
-                        const idCategoria = await obterCategoriaPadrao(connection);
-                        const nomeProduto = String(item.nome || `Produto Shopee ${skuLimpo}`).trim().substring(0, 200);
-                        const preco = item.valorUnitario || 0;
-                        const [insertProd]: any = await connection.query(
-                            `INSERT INTO PRODUTO (SKU_PRODUTO, NOME_PRODUTO, PRECO_VENDA, ID_CATEGORIA, IMPOSTO_PERCENTUAL, MAO_DE_OBRA_VALOR)
-                             VALUES (?, ?, ?, ?, 0, 0)`,
-                            [skuLimpo, nomeProduto, preco, idCategoria]
-                        );
-                        idProduto = insertProd.insertId;
-                    }
-
-                    if (idProduto) {
-                        await connection.query(`
-                            INSERT INTO ITEM_PEDIDO (ID_PEDIDO, ID_PRODUTO, QUANTIDADE, VALOR_UNITARIO)
-                            VALUES (?, ?, ?, ?)
-                        `, [novoId, idProduto, item.quantidade, item.valorUnitario]);
-                    }
-                }
-                criados++;
+        for (const pedidoShopee of pedidosShopee) {
+            if (setDuplicados.has(pedidoShopee.orderSn)) {
+                duplicados++;
+                continue;
             }
 
-            // Atualiza data da última sincronização
-            await connection.query('UPDATE CONFIGURACAO_SHOPEE SET ULTIMA_SINCRONIZACAO = NOW() WHERE ID = 1');
-            await connection.commit();
-        } catch (dbError) {
-            await connection.rollback();
-            throw dbError;
-        } finally {
-            connection.release();
-        }
+            // Marca como já processado neste lote para evitar que itens duplicados no mesmo payload da API sejam inseridos duas vezes
+            setDuplicados.add(pedidoShopee.orderSn);
 
-        await registrarLog('ADMIN', 'SHOPEE_SINCRONIZACAO', `Sincronização concluída: ${criados} criados, ${ignorados} já existiam.`);
-        res.json({
-            mensagem: `Sincronização concluída!`,
+            const [insertPedido]: any = await connection.query(
+                `INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO, PRAZO_ENVIO, COD_RASTREIO, VALOR_REPASSE, OBSERVACOES)
+                 VALUES (?, ?, 'Shopee', ?, ?, 'ENTRADA', ?, ?, ?, ?)`,
+                [
+                    pedidoShopee.nomeCliente,
+                    pedidoShopee.orderSn,
+                    pedidoShopee.valorTotal,
+                    pedidoShopee.dataPedido,
+                    (pedidoShopee as any).prazoEnvio || null,
+                    (pedidoShopee as any).trackingNumber || null,
+                    (pedidoShopee as any).valorRepasse || null,
+                    pedidoShopee.observacoes || null
+                ]
+            );
+
+            const idPedido = insertPedido.insertId;
+            criados++;
+
+            for (const item of pedidoShopee.itens) {
+                const skuNormalizado = String(item.sku || '').trim().toUpperCase();
+                const produto = mapaProdutos.get(skuNormalizado);
+
+                if (!produto) {
+                    if (skuNormalizado) {
+                        skusNaoEncontrados.add(skuNormalizado);
+                    }
+                    continue;
+                }
+
+                await connection.query(
+                    `INSERT INTO ITEM_PEDIDO (ID_PEDIDO, ID_PRODUTO, QUANTIDADE, VALOR_UNITARIO)
+                     VALUES (?, ?, ?, ?)`,
+                    [
+                        idPedido,
+                        produto.id,
+                        Math.max(1, Number(item.quantidade || 1)),
+                        Number(item.valorUnitario || produto.preco || 0)
+                    ]
+                );
+
+                itensCriados++;
+            }
+        }
+        const tipoSync = req.body.tipo === 'auto' ? 'auto' : 'manual';
+        const statusSync = skusNaoEncontrados.size > 0 ? 'parcial' : 'sucesso';
+        
+        await connection.query(`
+            INSERT INTO HISTORICO_SINCRONIZACAO_SHOPEE 
+            (TIPO_SINCRONIZACAO, STATUS, QTD_CRIADOS, QTD_DUPLICADOS, QTD_SKUS_INVALIDOS, REQUISICOES_USADAS, MENSAGEM)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [
+            tipoSync,
+            statusSync,
             criados,
-            ignorados,
-            total: pedidosShopee.length
+            duplicados,
+            skusNaoEncontrados.size,
+            3,
+            `${criados} pedidos criados.`
+        ]);
+
+        await connection.commit();
+
+        return res.status(201).json({
+            mensagem: 'Sincronização Shopee concluída.',
+            consultados: pedidosShopee.length,
+            criados,
+            itensCriados,
+            duplicados,
+            skusNaoEncontrados: Array.from(skusNaoEncontrados)
         });
     } catch (error: any) {
-        console.error('Erro ao sincronizar Shopee:', error);
-        res.status(500).json({ mensagem: String(error?.message || 'Erro ao sincronizar pedidos da Shopee') });
+        await connection.rollback();
+        console.error('Erro ao sincronizar pedidos Shopee:', error);
+
+        const mensagem = String(error?.message || 'Erro interno ao sincronizar pedidos.');
+        const statusCode = mensagem.includes('Configuração Shopee incompleta') ? 400 : 500;
+
+        try {
+            const connLog = await pool.getConnection();
+            await connLog.query(`
+                INSERT INTO HISTORICO_SINCRONIZACAO_SHOPEE 
+                (TIPO_SINCRONIZACAO, STATUS, MENSAGEM, REQUISICOES_USADAS)
+                VALUES (?, 'erro', ?, 1)
+            `, [req.body.tipo === 'auto' ? 'auto' : 'manual', mensagem.substring(0, 500)]);
+            connLog.release();
+        } catch (e) {
+            console.error('Erro ao gravar log de falha na sincronizacao Shopee:', e);
+        }
+
+        return res.status(statusCode).json({ mensagem });
+    } finally {
+        connection.release();
     }
 };
 
-/** POST /api/shopee/sincronizar-produtos — Sincroniza catálogo de produtos da Shopee → Banco */
+/** GET /api/shopee/historico — Retorna o histórico de sincronizações */
+export const obterHistoricoSync = async (req: Request, res: Response) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT 
+                ID_LOG as id,
+                DATA_SINCRONIZACAO as timestamp,
+                TIPO_SINCRONIZACAO as tipo,
+                STATUS as status,
+                QTD_CRIADOS as criados,
+                QTD_DUPLICADOS as duplicados,
+                QTD_SKUS_INVALIDOS as skus_invalidos,
+                REQUISICOES_USADAS as chamadas_usadas,
+                MENSAGEM as mensagem
+            FROM HISTORICO_SINCRONIZACAO_SHOPEE
+            ORDER BY DATA_SINCRONIZACAO DESC
+            LIMIT 50
+        `);
+        return res.json(rows);
+    } catch (error: any) {
+        console.error('Erro ao buscar histórico Shopee:', error);
+        return res.status(500).json({ mensagem: 'Erro interno ao buscar histórico.' });
+    }
+};
 export const sincronizarCatalogoShopee = async (req: Request, res: Response) => {
     try {
         const cfg = await getShopeeConfigFromDB();
@@ -411,3 +531,76 @@ export const sincronizarCatalogoShopee = async (req: Request, res: Response) => 
         res.status(500).json({ mensagem: String(error?.message || 'Erro ao sincronizar catálogo da Shopee') });
     }
 };
+
+/** POST /api/shopee/verificar-enviados — Atualiza pedidos Shopee que já foram enviados */
+export const verificarEnviadosShopee = async (req: Request, res: Response) => {
+    try {
+        const cfg = await getShopeeConfigFromDB();
+
+        if (!cfg.integracaoAtiva) {
+            return res.status(400).json({ mensagem: 'Integração Shopee desativada.', codigo: 'INTEGRACAO_DESATIVADA' });
+        }
+        if (!cfg.accessToken || !cfg.shopId || !cfg.partnerId || !cfg.partnerKey) {
+            return res.status(400).json({ mensagem: 'Integração não autorizada.', codigo: 'SEM_TOKEN' });
+        }
+
+        // Busca pedidos com status SHIPPED na Shopee (últimos 30 dias)
+        const diasAtras = Number(req.body?.dias || 30);
+        const timeTo = Math.floor(Date.now() / 1000);
+        const timeFrom = timeTo - (diasAtras * 24 * 60 * 60);
+
+        const pedidosEnviados = await buscarPedidosShopee({ timeFrom, timeTo, orderStatus: 'SHIPPED' });
+
+        if (pedidosEnviados.length === 0) {
+            return res.json({ mensagem: 'Nenhum pedido enviado encontrado no período.', atualizados: 0 });
+        }
+
+        const orderSns = pedidosEnviados.map(p => p.orderSn);
+        const placeholders = orderSns.map(() => '?').join(', ');
+
+        const connection = await pool.getConnection();
+        let atualizados = 0;
+
+        try {
+            await connection.beginTransaction();
+
+            // Atualiza apenas pedidos que existem no banco E não estão já como ENVIADO
+            const [result]: any = await connection.query(
+                `UPDATE PEDIDO SET STATUS_PEDIDO = 'ENVIADO'
+                 WHERE PLATAFORMA_ORIGEM = 'Shopee'
+                 AND NUM_PEDIDO_PLATAFORMA IN (${placeholders})
+                 AND STATUS_PEDIDO NOT IN ('ENVIADO', 'CANCELADO')`,
+                orderSns
+            );
+            atualizados = result.affectedRows || 0;
+
+            // Atualiza também COD_RASTREIO quando disponível
+            for (const pedido of pedidosEnviados) {
+                if (pedido.trackingNumber) {
+                    await connection.query(
+                        `UPDATE PEDIDO SET COD_RASTREIO = ? WHERE NUM_PEDIDO_PLATAFORMA = ? AND PLATAFORMA_ORIGEM = 'Shopee'`,
+                        [pedido.trackingNumber, pedido.orderSn]
+                    );
+                }
+            }
+
+            await connection.commit();
+        } catch (dbError) {
+            await connection.rollback();
+            throw dbError;
+        } finally {
+            connection.release();
+        }
+
+        await registrarLog('ADMIN', 'SHOPEE_VERIFICAR_ENVIADOS', `Verificação de enviados: ${atualizados} pedidos movidos para ENVIADO.`);
+        res.json({
+            mensagem: `Verificação concluída! ${atualizados} pedido(s) movido(s) para ENVIADO.`,
+            consultados: pedidosEnviados.length,
+            atualizados
+        });
+    } catch (error: any) {
+        console.error('Erro ao verificar enviados Shopee:', error);
+        res.status(500).json({ mensagem: String(error?.message || 'Erro ao verificar enviados') });
+    }
+};
+

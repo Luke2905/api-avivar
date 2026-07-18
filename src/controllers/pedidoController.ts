@@ -4,10 +4,7 @@ import pool from '../config/database';
 import { registrarLog } from '../services/logService';
 import { buscarPedidosShopee } from '../services/shopeeService';
 
-function converterDataParaUnixSegundos(valor: string) {
-    const timestamp = Math.floor(new Date(valor).getTime() / 1000);
-    return Number.isFinite(timestamp) ? timestamp : NaN;
-}
+
 
 // GET: Listar pedidos (Agora trazendo um resumo dos itens na listagem principal)
 export const listarPedidos = async (req: Request, res: Response) => {
@@ -21,7 +18,11 @@ export const listarPedidos = async (req: Request, res: Response) => {
             status,
             data_inicio,
             data_fim,
-            prazo_envio
+            prazo_envio,
+            prazo_vencido,
+            prazo_amanha,
+            order_by,
+            order_dir
         } = req.query as Record<string, string | undefined>;
 
         const filtros: string[] = [];
@@ -58,7 +59,9 @@ export const listarPedidos = async (req: Request, res: Response) => {
         }
 
         if (numero) {
-            filtros.push('p.NUM_PEDIDO_PLATAFORMA LIKE ?');
+            // Busca por número do pedido OU código de rastreio
+            filtros.push('(p.NUM_PEDIDO_PLATAFORMA LIKE ? OR p.COD_RASTREIO LIKE ?)');
+            params.push(`%${numero}%`);
             params.push(`%${numero}%`);
         }
 
@@ -72,7 +75,26 @@ export const listarPedidos = async (req: Request, res: Response) => {
             params.push(prazo_envio);
         }
 
+        // Filtros rápidos de prazo
+        if (prazo_vencido === 'true') {
+            filtros.push('p.PRAZO_ENVIO IS NOT NULL AND DATE(p.PRAZO_ENVIO) < CURDATE()');
+        }
+        if (prazo_amanha === 'true') {
+            filtros.push('p.PRAZO_ENVIO IS NOT NULL AND DATE(p.PRAZO_ENVIO) = DATE_ADD(CURDATE(), INTERVAL 1 DAY)');
+        }
+
         const whereClause = filtros.length > 0 ? `WHERE ${filtros.join(' AND ')}` : '';
+
+        // Ordenação segura com whitelist
+        const COLUNAS_PERMITIDAS: Record<string, string> = {
+            data: 'p.DATA_PEDIDO',
+            prazo: 'p.PRAZO_ENVIO',
+            valor: 'p.VALOR_TOTAL',
+            cliente: 'p.NOME_CLIENTE',
+            pedido: 'p.NUM_PEDIDO_PLATAFORMA',
+        };
+        const colunaOrdem = COLUNAS_PERMITIDAS[order_by || ''] || 'p.DATA_PEDIDO';
+        const direcaoOrdem = order_dir?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
 
         const query = `
             SELECT 
@@ -101,7 +123,7 @@ export const listarPedidos = async (req: Request, res: Response) => {
                 GROUP BY ip.ID_PEDIDO
             ) custos ON custos.ID_PEDIDO = p.ID_PEDIDO
             ${whereClause}
-            ORDER BY p.DATA_PEDIDO DESC
+            ORDER BY ${colunaOrdem} ${direcaoOrdem}
         `;
 
         const [rows] = await pool.query(query, params);
@@ -140,7 +162,7 @@ export const obterDetalhesPedido = async (req: Request, res: Response) => {
 
 // POST: Criar Pedido COM ITENS (Transação no Banco)
 export const criarPedido = async (req: Request, res: Response) => {
-    const { nome_cliente, num_pedido, plataforma, itens, prazo_envio, link_arte, observacoes } = req.body; 
+    const { nome_cliente, num_pedido, plataforma, itens, prazo_envio, link_arte, observacoes, desconto_valor, desconto_percentual } = req.body; 
     // 'itens' deve ser um array: [{ id_produto, quantidade, valor_unitario }]
 
     const connection = await pool.getConnection(); // Pega conexão exclusiva para transação
@@ -149,17 +171,26 @@ export const criarPedido = async (req: Request, res: Response) => {
         await connection.beginTransaction(); // Inicia a transação (Tudo ou Nada)
 
         // 1. Calcula o total somando os itens
-        const total = itens.reduce((acc: number, item: any) => acc + (item.quantidade * item.valor_unitario), 0);
+        const subtotal = itens.reduce((acc: number, item: any) => acc + (item.quantidade * item.valor_unitario), 0);
 
-        // 2. Insere o Pedido (Cabeçalho)
+        // 2. Aplica desconto (prioridade: valor fixo > percentual)
+        let desconto = 0;
+        if (Number(desconto_valor) > 0) {
+            desconto = Number(desconto_valor);
+        } else if (Number(desconto_percentual) > 0) {
+            desconto = subtotal * (Number(desconto_percentual) / 100);
+        }
+        const total = Math.max(0, subtotal - desconto);
+
+        // 3. Insere o Pedido (Cabeçalho)
         const [result]: any = await connection.query(`
-            INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO, PRAZO_ENVIO, LINK_ARTE, OBSERVACOES)
-            VALUES (?, ?, ?, ?, NOW(), 'ENTRADA', ?, ?, ?)
-        `, [nome_cliente, num_pedido, plataforma, total, prazo_envio || null, link_arte || null, observacoes || null]);
+            INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DESCONTO, DATA_PEDIDO, STATUS_PEDIDO, PRAZO_ENVIO, LINK_ARTE, OBSERVACOES)
+            VALUES (?, ?, ?, ?, ?, NOW(), 'ENTRADA', ?, ?, ?)
+        `, [nome_cliente, num_pedido, plataforma, total, desconto > 0 ? desconto : null, prazo_envio || null, link_arte || null, observacoes || null]);
 
         const novoIdPedido = result.insertId;
 
-        // 3. Insere cada Item
+        // 4. Insere cada Item
         for (const item of itens) {
             await connection.query(`
                 INSERT INTO ITEM_PEDIDO (ID_PEDIDO, ID_PRODUTO, QUANTIDADE, VALOR_UNITARIO)
@@ -180,7 +211,7 @@ export const criarPedido = async (req: Request, res: Response) => {
     }
 };
 
-// PATCH: Atualizar status (já existia, mantenha igual)
+// PATCH: Atualizar status (ja existia, mantenha igual)
 export const atualizarStatusPedido = async (req: Request, res: Response) => {
     const { id } = req.params;
     const { novo_status } = req.body;
@@ -212,17 +243,14 @@ export const importarPedidosLote = async (req: Request, res: Response) => {
         
         const mapaProdutos = new Map();
         produtosDb.forEach((p: any) => {
-            // Normalização Pesada: Remove espaços e converte p/ maiúsculo
             const skuNormalizado = String(p.SKU_PRODUTO).trim().toUpperCase();
             mapaProdutos.set(skuNormalizado, { id: p.ID_PRODUTO, preco: p.PRECO_VENDA });
         });
 
-        console.log('--- INÍCIO DA IMPORTAÇÃO ---');
+        console.log('--- INICIO DA IMPORTACAO ---');
         console.log(`SKUs no Banco (${mapaProdutos.size}):`, Array.from(mapaProdutos.keys()));
 
-        // Itera sobre cada pedido
         for (const p of pedidos) {
-            // Insere Pedido... (código igual ao anterior)
             const [resPedido]: any = await connection.query(`
                 INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO)
                 VALUES (?, ?, ?, ?, ?, 'ENTRADA')
@@ -237,31 +265,19 @@ export const importarPedidosLote = async (req: Request, res: Response) => {
             const novoIdPedido = resPedido.insertId;
             pedidosCriados++;
 
-            // Processa Itens
             if (p.itens && p.itens.length > 0) {
                 for (const item of p.itens) {
-                    // Normalização Pesada do que vem do Excel
                     const skuBruto = item.sku;
                     const skuLimpo = String(skuBruto || '').trim().toUpperCase();
-                    
                     console.log(`Processando Item: Excel="${skuBruto}" -> Limpo="${skuLimpo}"`);
-
                     const produtoEncontrado = mapaProdutos.get(skuLimpo);
-
                     if (produtoEncontrado) {
                         await connection.query(`
                             INSERT INTO ITEM_PEDIDO (ID_PEDIDO, ID_PRODUTO, QUANTIDADE, VALOR_UNITARIO)
                             VALUES (?, ?, ?, ?)
-                        `, [
-                            novoIdPedido,
-                            produtoEncontrado.id,
-                            item.qtd || 1,
-                            produtoEncontrado.preco
-                        ]);
+                        `, [novoIdPedido, produtoEncontrado.id, item.qtd || 1, produtoEncontrado.preco]);
                         itensCriados++;
-                        console.log(`✅ Encontrado! ID: ${produtoEncontrado.id}`);
                     } else {
-                        console.warn(`❌ SKU NÃO ENCONTRADO: "${skuLimpo}"`);
                         skusNaoEncontrados.push(skuLimpo);
                     }
                 }
@@ -270,10 +286,9 @@ export const importarPedidosLote = async (req: Request, res: Response) => {
 
         await connection.commit();
         
-        // Mensagem de resposta mais detalhada
-        let msg = `Importação concluída! ${pedidosCriados} pedidos e ${itensCriados} itens processados.`;
+        let msg = `Importacao concluida! ${pedidosCriados} pedidos e ${itensCriados} itens processados.`;
         if (skusNaoEncontrados.length > 0) {
-            msg += ` ATENÇÃO: ${skusNaoEncontrados.length} itens ignorados por SKU inválido (Ex: ${skusNaoEncontrados[0]}).`;
+            msg += ` ATENCAO: ${skusNaoEncontrados.length} itens ignorados por SKU invalido (Ex: ${skusNaoEncontrados[0]}).`;
         }
 
         res.status(201).json({ mensagem: msg });
@@ -281,12 +296,10 @@ export const importarPedidosLote = async (req: Request, res: Response) => {
     } catch (error) {
         await connection.rollback();
         console.error('Erro:', error);
-        res.status(500).json({ mensagem: 'Erro ao processar importação.' });
+        res.status(500).json({ mensagem: 'Erro ao processar importacao.' });
     } finally {
         connection.release();
     }
-
-    
 };
 
 // DELETE: Excluir pedido e seus itens
@@ -398,160 +411,32 @@ export const atualizarPedido = async (req: Request, res: Response) => {
     }
 };
 
-export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
-    const {
-        dias = 7,
-        data_inicio,
-        data_fim,
-        status,
-    } = req.body || {};
+// PATCH: Alterar status de múltiplos pedidos (em massa)
+export const alterarStatusEmMassa = async (req: Request, res: Response) => {
+    const { ids, novo_status } = req.body;
 
-    let timeFrom: number;
-    let timeTo: number;
-
-    if (data_inicio && data_fim) {
-        timeFrom = converterDataParaUnixSegundos(String(data_inicio));
-        timeTo = converterDataParaUnixSegundos(String(data_fim));
-
-        if (!Number.isFinite(timeFrom) || !Number.isFinite(timeTo)) {
-            return res.status(400).json({
-                mensagem: 'Datas inválidas. Use formato ISO (ex: 2026-04-03T00:00:00Z).'
-            });
-        }
-    } else {
-        const diasNumero = Number(dias);
-        if (!Number.isFinite(diasNumero) || diasNumero <= 0) {
-            return res.status(400).json({ mensagem: 'O campo "dias" precisa ser um número maior que zero.' });
-        }
-
-        timeTo = Math.floor(Date.now() / 1000);
-        timeFrom = timeTo - Math.floor(diasNumero * 24 * 60 * 60);
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ mensagem: 'Forneça uma lista de IDs.' });
     }
-
-    if (timeFrom > timeTo) {
-        return res.status(400).json({ mensagem: '"data_inicio" não pode ser maior que "data_fim".' });
+    if (!novo_status) {
+        return res.status(400).json({ mensagem: 'Informe o novo status.' });
     }
 
     const connection = await pool.getConnection();
-
     try {
-        const pedidosShopee = await buscarPedidosShopee({
-            timeFrom,
-            timeTo,
-            orderStatus: status
-        });
-
-        if (pedidosShopee.length === 0) {
-            return res.status(200).json({
-                mensagem: 'Nenhum pedido retornado pela Shopee para o período informado.',
-                consultados: 0,
-                criados: 0,
-                itensCriados: 0,
-                duplicados: 0,
-                skusNaoEncontrados: []
-            });
-        }
-
         await connection.beginTransaction();
-
-        const [produtosDb]: any = await connection.query('SELECT ID_PRODUTO, SKU_PRODUTO, PRECO_VENDA FROM PRODUTO');
-        const mapaProdutos = new Map<string, { id: number; preco: number }>();
-        produtosDb.forEach((produto: any) => {
-            const sku = String(produto.SKU_PRODUTO || '').trim().toUpperCase();
-            if (sku) {
-                mapaProdutos.set(sku, {
-                    id: produto.ID_PRODUTO,
-                    preco: Number(produto.PRECO_VENDA || 0)
-                });
-            }
-        });
-
-        const orderSns = pedidosShopee.map((pedido) => pedido.orderSn);
-        let setDuplicados = new Set<string>();
-        if (orderSns.length > 0) {
-            const placeholders = orderSns.map(() => '?').join(', ');
-            const [pedidosExistentes]: any = await connection.query(
-                `SELECT NUM_PEDIDO_PLATAFORMA
-                 FROM PEDIDO
-                 WHERE PLATAFORMA_ORIGEM = 'Shopee'
-                 AND NUM_PEDIDO_PLATAFORMA IN (${placeholders})`,
-                orderSns
-            );
-            setDuplicados = new Set<string>(
-                pedidosExistentes.map((pedido: any) => String(pedido.NUM_PEDIDO_PLATAFORMA))
-            );
-        }
-
-        let criados = 0;
-        let itensCriados = 0;
-        let duplicados = 0;
-        const skusNaoEncontrados = new Set<string>();
-
-        for (const pedidoShopee of pedidosShopee) {
-            if (setDuplicados.has(pedidoShopee.orderSn)) {
-                duplicados++;
-                continue;
-            }
-
-            const [insertPedido]: any = await connection.query(
-                `INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO, OBSERVACOES)
-                 VALUES (?, ?, 'Shopee', ?, ?, 'ENTRADA', ?)`,
-                [
-                    pedidoShopee.nomeCliente,
-                    pedidoShopee.orderSn,
-                    pedidoShopee.valorTotal,
-                    pedidoShopee.dataPedido,
-                    pedidoShopee.observacoes || null
-                ]
-            );
-
-            const idPedido = insertPedido.insertId;
-            criados++;
-
-            for (const item of pedidoShopee.itens) {
-                const skuNormalizado = String(item.sku || '').trim().toUpperCase();
-                const produto = mapaProdutos.get(skuNormalizado);
-
-                if (!produto) {
-                    if (skuNormalizado) {
-                        skusNaoEncontrados.add(skuNormalizado);
-                    }
-                    continue;
-                }
-
-                await connection.query(
-                    `INSERT INTO ITEM_PEDIDO (ID_PEDIDO, ID_PRODUTO, QUANTIDADE, VALOR_UNITARIO)
-                     VALUES (?, ?, ?, ?)`,
-                    [
-                        idPedido,
-                        produto.id,
-                        Math.max(1, Number(item.quantidade || 1)),
-                        Number(item.valorUnitario || produto.preco || 0)
-                    ]
-                );
-
-                itensCriados++;
-            }
-        }
-
+        const placeholders = ids.map(() => '?').join(', ');
+        const [result]: any = await connection.query(
+            `UPDATE PEDIDO SET STATUS_PEDIDO = ? WHERE ID_PEDIDO IN (${placeholders})`,
+            [novo_status, ...ids]
+        );
         await connection.commit();
-
-        return res.status(201).json({
-            mensagem: 'Sincronização Shopee concluída.',
-            consultados: pedidosShopee.length,
-            criados,
-            itensCriados,
-            duplicados,
-            skusNaoEncontrados: Array.from(skusNaoEncontrados)
-        });
-    } catch (error: any) {
+        await registrarLog('SISTEMA', 'ALTERAR_STATUS_MASSA', `${result.affectedRows} pedidos movidos para ${novo_status}.`);
+        res.json({ mensagem: `${result.affectedRows} pedido(s) atualizados para ${novo_status}.`, atualizados: result.affectedRows });
+    } catch (error) {
         await connection.rollback();
-        console.error('Erro ao sincronizar pedidos Shopee:', error);
-
-        const mensagem = String(error?.message || 'Erro interno ao sincronizar pedidos.');
-        const statusCode = mensagem.includes('Configuração Shopee incompleta') ? 400 : 500;
-
-        return res.status(statusCode).json({ mensagem });
+        console.error('Erro ao alterar status em massa:', error);
+        res.status(500).json({ mensagem: 'Erro ao alterar status em massa.' });
     } finally {
         connection.release();
     }

@@ -8,7 +8,7 @@ import {
   excluirPedido,
   atualizarNotaFiscal,
   atualizarPedido,
-  sincronizarPedidosShopee
+  alterarStatusEmMassa
 } from '../controllers/pedidoController';
 import { autorizarPerfis, protegerRota } from '../middlewares/authMiddleware';
 
@@ -24,6 +24,6 @@ router.post('/importar', protegerRota, autorizarPerfis('ADMIN', 'ARTES', 'FINANC
 router.patch('/:id/nf', protegerRota, autorizarPerfis('ADMIN', 'FINANCEIRO'), atualizarNotaFiscal);
 
 router.patch('/:id/status', protegerRota, autorizarPerfis('ADMIN', 'PRODUCAO', 'ARTES', 'FINANCEIRO'), atualizarStatusPedido);
-router.post('/shopee/sincronizar', protegerRota, autorizarPerfis('ADMIN', 'FINANCEIRO'), sincronizarPedidosShopee);
+router.patch('/massa/status', protegerRota, autorizarPerfis('ADMIN', 'ARTES', 'FINANCEIRO'), alterarStatusEmMassa);
 
 export default router;
