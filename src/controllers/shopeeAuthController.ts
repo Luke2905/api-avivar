@@ -281,6 +281,10 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
     const connection = await pool.getConnection();
 
     try {
+        // Instrui o TiDB a encerrar esta sessão após 60s de inatividade,
+        // evitando locks órfãos caso a conexão caia no meio da transação.
+        await connection.query('SET SESSION wait_timeout = 60');
+
         const pedidosShopee = await buscarPedidosShopee({
             timeFrom,
             timeTo,

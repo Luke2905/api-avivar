@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import cron from 'node-cron';
 import { testarConexao } from './config/database';
+import pool from './config/database';
+import { withRetry } from './utils/withRetry';
 import produtoRoutes from './routes/produtoRoutes';
 import usuarioRoutes from './routes/usuarioRoutes';
 import authRoutes from './routes/authRoutes';
@@ -50,25 +52,58 @@ app.get('/', (req, res) => {
 
 async function executarSincronizacaoAutomatica() {
     const agora = new Date().toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' });
-    console.log(`[CRON] Iniciando sincronização automática Shopee às ${agora} (Horário de Brasília)`);
+    console.log(`[CRON] ─── Sincronização automática Shopee iniciando às ${agora} (BRT) ───`);
+
+    // ── Etapa 1: Warm-up ────────────────────────────────────────────────────────
+    // Acorda o TiDB antes de qualquer operação de sync. O withRetry aguarda até
+    // ~65s no total (30s timeout × 3 tentativas com backoff 5s→10s), cobrindo
+    // cold-starts lentos. O sync só avança após confirmação de conexão ativa.
     try {
-        // Cria req/res simulados para reutilizar os handlers existentes
+        console.log('[CRON] Etapa 1/3: Aquecendo banco de dados...');
+        await withRetry(
+            () => pool.query('SELECT 1'),
+            { rotulo: 'warm-up TiDB', tentativas: 3, delayInicial: 5_000 }
+        );
+        console.log('[CRON] Banco aquecido. Prosseguindo com a sincronização.');
+    } catch (err) {
+        console.error('[CRON] Banco não respondeu após todas as tentativas de warm-up. Sync cancelado.', err);
+        return; // aborta o ciclo — não arrisca uma sync com banco instável
+    }
+
+    // ── Etapa 2: Sincronizar pedidos ────────────────────────────────────────────
+    console.log('[CRON] Etapa 2/3: Sincronizando pedidos Shopee (últimos 15 dias)...');
+    try {
         const fakeReq: any = { body: { dias: 15, tipo: 'auto' } };
         const fakeRes: any = {
-            status: (code: number) => ({ json: (data: any) => console.log(`[CRON] Sync Pedidos: ${code}`, JSON.stringify(data)) }),
+            status: (code: number) => ({ json: (data: any) => console.log(`[CRON] Sync Pedidos [${code}]:`, JSON.stringify(data)) }),
             json: (data: any) => console.log('[CRON] Sync Pedidos:', JSON.stringify(data))
         };
-        await sincronizarPedidosShopee(fakeReq, fakeRes);
+        await withRetry(
+            () => sincronizarPedidosShopee(fakeReq, fakeRes),
+            { rotulo: 'sincronizarPedidosShopee', tentativas: 3, delayInicial: 5_000 }
+        );
+    } catch (err) {
+        console.error('[CRON] Etapa 2 falhou após todas as tentativas:', err);
+    }
 
+    // ── Etapa 3: Verificar enviados ─────────────────────────────────────────────
+    console.log('[CRON] Etapa 3/3: Verificando pedidos enviados (últimos 30 dias)...');
+    try {
         const fakeReq2: any = { body: { dias: 30, tipo: 'auto' } };
         const fakeRes2: any = {
-            status: (code: number) => ({ json: (data: any) => console.log(`[CRON] Verificar Enviados: ${code}`, JSON.stringify(data)) }),
+            status: (code: number) => ({ json: (data: any) => console.log(`[CRON] Verificar Enviados [${code}]:`, JSON.stringify(data)) }),
             json: (data: any) => console.log('[CRON] Verificar Enviados:', JSON.stringify(data))
         };
-        await verificarEnviadosShopee(fakeReq2, fakeRes2);
+        await withRetry(
+            () => verificarEnviadosShopee(fakeReq2, fakeRes2),
+            { rotulo: 'verificarEnviadosShopee', tentativas: 3, delayInicial: 5_000 }
+        );
     } catch (err) {
-        console.error('[CRON] Erro na sincronização automática:', err);
+        console.error('[CRON] Etapa 3 falhou após todas as tentativas:', err);
     }
+
+    const fim = new Date().toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    console.log(`[CRON] ─── Sincronização automática concluída às ${fim} (BRT) ───`);
 }
 
 // Horários configurados (expressos em UTC para o cron)

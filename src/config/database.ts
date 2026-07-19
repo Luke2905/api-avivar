@@ -66,8 +66,11 @@ const poolConfig: mysql.PoolOptions = {
   database: dbDatabase,
   port: dbPort,
   waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+  connectionLimit: 5,       // adequado ao free tier do TiDB
+  queueLimit: 0,
+  connectTimeout: 30_000,   // 30s: tempo suficiente para o TiDB acordar do cold-start
+  enableKeepAlive: true,    // TCP keepalives nas conexões abertas
+  keepAliveInitialDelay: 10_000, // detecta conexões stale a cada 10s
 };
 
 if (dbSsl) {
