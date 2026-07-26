@@ -29,7 +29,8 @@ export const listarPedidos = async (req: Request, res: Response) => {
         const params: (string | number)[] = [];
 
         if (dia) {
-            filtros.push('DATE(p.DATA_PEDIDO) = ?');
+            // Usar DATE_FORMAT evita problema de timezone: compara string YYYY-MM-DD diretamente
+            filtros.push("DATE_FORMAT(p.DATA_PEDIDO, '%Y-%m-%d') = ?");
             params.push(dia);
         }
 
@@ -162,7 +163,7 @@ export const obterDetalhesPedido = async (req: Request, res: Response) => {
 
 // POST: Criar Pedido COM ITENS (Transação no Banco)
 export const criarPedido = async (req: Request, res: Response) => {
-    const { nome_cliente, num_pedido, plataforma, itens, prazo_envio, link_arte, observacoes, desconto_valor, desconto_percentual } = req.body; 
+    const { nome_cliente, num_pedido, plataforma, itens, prazo_envio, link_arte, observacoes, desconto_valor, desconto_percentual, valor_repasse } = req.body; 
     // 'itens' deve ser um array: [{ id_produto, quantidade, valor_unitario }]
 
     const connection = await pool.getConnection(); // Pega conexão exclusiva para transação
@@ -184,9 +185,9 @@ export const criarPedido = async (req: Request, res: Response) => {
 
         // 3. Insere o Pedido (Cabeçalho)
         const [result]: any = await connection.query(`
-            INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DESCONTO, DATA_PEDIDO, STATUS_PEDIDO, PRAZO_ENVIO, LINK_ARTE, OBSERVACOES)
-            VALUES (?, ?, ?, ?, ?, NOW(), 'ENTRADA', ?, ?, ?)
-        `, [nome_cliente, num_pedido, plataforma, total, desconto > 0 ? desconto : null, prazo_envio || null, link_arte || null, observacoes || null]);
+            INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DESCONTO, DATA_PEDIDO, STATUS_PEDIDO, PRAZO_ENVIO, LINK_ARTE, OBSERVACOES, VALOR_REPASSE)
+            VALUES (?, ?, ?, ?, ?, NOW(), 'ENTRADA', ?, ?, ?, ?)
+        `, [nome_cliente, num_pedido, plataforma, total, desconto > 0 ? desconto : null, prazo_envio || null, link_arte || null, observacoes || null, valor_repasse !== undefined ? valor_repasse : null]);
 
         const novoIdPedido = result.insertId;
 
@@ -211,15 +212,80 @@ export const criarPedido = async (req: Request, res: Response) => {
     }
 };
 
-// PATCH: Atualizar status (ja existia, mantenha igual)
+// Helper: Baixa automática de matéria-prima ao mover pedido para PRODUCAO ou ENVIADO
+async function tentarBaixarEstoque(idPedido: string | number, connection: any): Promise<string> {
+    try {
+        const queryCalculo = `
+            SELECT 
+                m.ID_MATERIA,
+                m.NOME_MATERIA,
+                m.SALDO_ESTOQUE,
+                SUM(ft.QTD_CONSUMO * ip.QUANTIDADE) as TOTAL_NECESSARIO
+            FROM ITEM_PEDIDO ip
+            JOIN FICHA_TECNICA ft ON ip.ID_PRODUTO = ft.ID_PRODUTO
+            JOIN MATERIA_PRIMA m ON ft.ID_MATERIA = m.ID_MATERIA
+            WHERE ip.ID_PEDIDO = ?
+            GROUP BY m.ID_MATERIA, m.NOME_MATERIA, m.SALDO_ESTOQUE
+        `;
+        const [materiais]: any = await connection.query(queryCalculo, [idPedido]);
+
+        if (materiais.length === 0) return 'Sem ficha técnica para baixar.';
+
+        // Verificar se já houve baixa para esse pedido (evita dupla baixa)
+        const [movimentoExistente]: any = await connection.query(
+            `SELECT COUNT(*) as total FROM MOVIMENTO_ESTOQUE WHERE ID_PEDIDO_REF = ? AND TIPO_MOVIMENTO = 'SAIDA_OP'`,
+            [idPedido]
+        );
+        if (movimentoExistente[0].total > 0) return 'Baixa já realizada anteriormente.';
+
+        for (const item of materiais) {
+            const qtdBaixar = Number(item.TOTAL_NECESSARIO);
+            const saldoAntigo = Number(item.SALDO_ESTOQUE);
+            const saldoNovo = Math.max(0, saldoAntigo - qtdBaixar);
+
+            await connection.query(
+                'UPDATE MATERIA_PRIMA SET SALDO_ESTOQUE = ? WHERE ID_MATERIA = ?',
+                [saldoNovo, item.ID_MATERIA]
+            );
+            await connection.query(
+                `INSERT INTO MOVIMENTO_ESTOQUE 
+                (ID_MATERIA, TIPO_MOVIMENTO, QTD_MOVIMENTADA, SALDO_ANTERIOR, SALDO_NOVO, ID_PEDIDO_REF) 
+                VALUES (?, 'SAIDA_OP', ?, ?, ?, ?)`,
+                [item.ID_MATERIA, qtdBaixar, saldoAntigo, saldoNovo, idPedido]
+            );
+        }
+        return `${materiais.length} insumo(s) baixados do estoque.`;
+    } catch (err) {
+        console.error('[Estoque] Erro na baixa automática de matéria-prima:', err);
+        return 'Erro na baixa de estoque (não bloqueante).';
+    }
+}
+
+// PATCH: Atualizar status — com baixa automática de matéria-prima para PRODUCAO/ENVIADO
 export const atualizarStatusPedido = async (req: Request, res: Response) => {
     const { id } = req.params;
     const { novo_status } = req.body;
+    const connection = await pool.getConnection();
     try {
-        await pool.query('UPDATE PEDIDO SET STATUS_PEDIDO = ? WHERE ID_PEDIDO = ?', [novo_status, id]);
-        await registrarLog('SISTEMA', 'ATUALIZAR_STATUS', `Status do pedido ${id} alterado para ${novo_status}.`);
-        res.json({ mensagem: 'Status atualizado!' });
-    } catch (error) { res.status(500).json({ mensagem: 'Erro' }); }
+        await connection.beginTransaction();
+        await connection.query('UPDATE PEDIDO SET STATUS_PEDIDO = ? WHERE ID_PEDIDO = ?', [novo_status, id]);
+
+        let mensagemEstoque = '';
+        // Baixa automática ao mover para PRODUCAO ou ENVIADO
+        if (novo_status === 'PRODUCAO' || novo_status === 'ENVIADO') {
+            mensagemEstoque = await tentarBaixarEstoque(id, connection);
+        }
+
+        await connection.commit();
+        await registrarLog('SISTEMA', 'ATUALIZAR_STATUS', `Status do pedido ${id} alterado para ${novo_status}. ${mensagemEstoque}`);
+        res.json({ mensagem: 'Status atualizado!', estoque: mensagemEstoque });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Erro ao atualizar status:', error);
+        res.status(500).json({ mensagem: 'Erro ao atualizar status.' });
+    } finally {
+        connection.release();
+    }
 };
 
 export const importarPedidosLote = async (req: Request, res: Response) => {
@@ -361,7 +427,7 @@ export const atualizarNotaFiscal = async (req: Request, res: Response) => {
 
 export const atualizarPedido = async (req: Request, res: Response) => {
     const { id } = req.params;
-    const { nome_cliente, num_pedido, plataforma, valor_total, itens, prazo_envio, link_arte, observacoes } = req.body;
+    const { nome_cliente, num_pedido, plataforma, valor_total, itens, prazo_envio, link_arte, observacoes, valor_repasse } = req.body;
     // 'itens' espera um array: [{ id_produto, quantidade, valor_unitario }]
 
     const connection = await pool.getConnection();
@@ -378,9 +444,10 @@ export const atualizarPedido = async (req: Request, res: Response) => {
                 VALOR_TOTAL = ?,
                 PRAZO_ENVIO = ?,
                 LINK_ARTE = ?,
-                OBSERVACOES = ?
+                OBSERVACOES = ?,
+                VALOR_REPASSE = COALESCE(?, VALOR_REPASSE)
             WHERE ID_PEDIDO = ?
-        `, [nome_cliente, num_pedido, plataforma, valor_total, prazo_envio || null, link_arte || null, observacoes || null, id]);
+        `, [nome_cliente, num_pedido, plataforma, valor_total, prazo_envio || null, link_arte || null, observacoes || null, valor_repasse !== undefined ? valor_repasse : null, id]);
 
         // 2. Atualiza os ITENS (Estratégia: Remove tudo e insere de novo)
         // Essa é a estratégia mais segura e simples para garantir que a lista fique igual ao front
@@ -430,9 +497,18 @@ export const alterarStatusEmMassa = async (req: Request, res: Response) => {
             `UPDATE PEDIDO SET STATUS_PEDIDO = ? WHERE ID_PEDIDO IN (${placeholders})`,
             [novo_status, ...ids]
         );
+
+        let mensagemEstoque = '';
+        if (novo_status === 'PRODUCAO' || novo_status === 'ENVIADO') {
+            for (const id of ids) {
+                await tentarBaixarEstoque(id, connection);
+            }
+            mensagemEstoque = ' (Estoque atualizado)';
+        }
+
         await connection.commit();
-        await registrarLog('SISTEMA', 'ALTERAR_STATUS_MASSA', `${result.affectedRows} pedidos movidos para ${novo_status}.`);
-        res.json({ mensagem: `${result.affectedRows} pedido(s) atualizados para ${novo_status}.`, atualizados: result.affectedRows });
+        await registrarLog('SISTEMA', 'ALTERAR_STATUS_MASSA', `${result.affectedRows} pedidos movidos para ${novo_status}.${mensagemEstoque}`);
+        res.json({ mensagem: `${result.affectedRows} pedido(s) atualizados para ${novo_status}.${mensagemEstoque}`, atualizados: result.affectedRows });
     } catch (error) {
         await connection.rollback();
         console.error('Erro ao alterar status em massa:', error);

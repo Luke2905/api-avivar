@@ -29,8 +29,9 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
                 YEAR(p.DATA_PEDIDO) as ano_pedido,
                 p.ID_PEDIDO,
                 p.VALOR_TOTAL,
+                p.VALOR_REPASSE,
                 p.PLATAFORMA_ORIGEM,
-                DATE(p.DATA_PEDIDO) as data_exata
+                DATE_FORMAT(p.DATA_PEDIDO, '%Y-%m-%d') as data_exata
             FROM PEDIDO p
             WHERE YEAR(p.DATA_PEDIDO) = ? 
             ${mesBusca ? 'AND MONTH(p.DATA_PEDIDO) = ?' : ''}
@@ -87,6 +88,7 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
             const qtdVendas = pedidosDoMes.length;
             const qtdProdutos = itensDoMes.reduce((acc: number, i: any) => acc + Number(i.QUANTIDADE), 0);
             const faturamento = pedidosDoMes.reduce((acc: number, p: any) => acc + Number(p.VALOR_TOTAL || 0), 0);
+            const totalRepasse = pedidosDoMes.reduce((acc: number, p: any) => acc + Number(p.VALOR_REPASSE || 0), 0);
             
             const custoProducao = itensDoMes.reduce((acc: number, i: any) => acc + (Number(i.QUANTIDADE) * Number(i.CUSTO_MATERIAIS_UNITARIO)), 0);
             const custoMaoDeObra = itensDoMes.reduce((acc: number, i: any) => acc + (Number(i.QUANTIDADE) * Number(i.MAO_DE_OBRA_VALOR || 0)), 0);
@@ -111,6 +113,7 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
                 qtdProdutos,
                 meta,
                 faturamento,
+                totalRepasse,
                 custoProducao,
                 custoMaoDeObra,
                 ads,
@@ -123,21 +126,22 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
         });
 
         // --- D. INDICADORES GERAIS (Topo da Tela) ---
-        // Se estiver filtrado por mês, mostra do mês. Se for por ano, mostra do ano.
+        // Faturamento do Dia Atual
+        const agora = new Date();
+        const hojeDate = `${agora.getFullYear()}-${String(agora.getMonth()+1).padStart(2,'0')}-${String(agora.getDate()).padStart(2,'0')}`;
+        const pedidosHoje = pedidosRaw.filter((p: any) => p.data_exata === hojeDate);
+        const faturamentoHoje = pedidosHoje.reduce((acc: number, p: any) => acc + Number(p.VALOR_TOTAL || 0), 0);
+        const repasseHoje = pedidosHoje.reduce((acc: number, p: any) => acc + Number(p.VALOR_REPASSE || 0), 0);
+
         const faturamentoTotal = tabelaConsolidada.reduce((acc: number, m: any) => acc + m.faturamento, 0);
         const metaTotal = tabelaConsolidada.reduce((acc: number, m: any) => acc + m.meta, 0);
         const lucroTotal = tabelaConsolidada.reduce((acc: number, m: any) => acc + m.lucroLiquido, 0);
         const custosTotais = tabelaConsolidada.reduce((acc: number, m: any) => acc + m.custoTotal, 0);
-
-        // Faturamento do Dia Atual
-        const hojeDate = new Date().toISOString().split('T')[0];
-        const pedidosHoje = pedidosRaw.filter((p: any) => new Date(p.data_exata).toISOString().split('T')[0] === hojeDate);
-        const faturamentoHoje = pedidosHoje.reduce((acc: number, p: any) => acc + Number(p.VALOR_TOTAL || 0), 0);
+        const totalRepasse = tabelaConsolidada.reduce((acc: number, m: any) => acc + m.totalRepasse, 0);
 
         // Comparativo Mês Anterior (Crescimento %)
         let crescimentoPercentual = 0;
         if (mesBusca) {
-            // Precisa buscar o faturamento do mês anterior
             let mesAnterior = mesBusca - 1;
             let anoAnterior = anoBusca;
             if (mesAnterior === 0) { mesAnterior = 12; anoAnterior--; }
@@ -170,21 +174,25 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
             value: faturamentoPlataforma[k]
         }));
 
-        // Gráfico de Linha (Evolução Diária) - Apenas se filtrado por Mês
+        // Gráfico de Linha (Evolução Diária) — usa data_exata como string diretamente, sem conversão de timezone
         let graficoLinha: any[] = [];
         if (mesBusca) {
             const diasNoMes = new Date(anoBusca, mesBusca, 0).getDate();
             for (let d = 1; d <= diasNoMes; d++) {
-                // Formato YYYY-MM-DD
+                // Formato YYYY-MM-DD para comparação direta com a string do banco
                 const dataStr = `${anoBusca}-${String(mesBusca).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
                 const fatDia = pedidosRaw
-                    .filter((p: any) => new Date(p.data_exata).toISOString().split('T')[0] === dataStr)
+                    .filter((p: any) => String(p.data_exata) === dataStr)
                     .reduce((acc: number, p: any) => acc + Number(p.VALOR_TOTAL), 0);
+                const repasseDia = pedidosRaw
+                    .filter((p: any) => String(p.data_exata) === dataStr)
+                    .reduce((acc: number, p: any) => acc + Number(p.VALOR_REPASSE || 0), 0);
                 
                 graficoLinha.push({
                     dia: String(d),
                     dataCompleta: dataStr,
-                    faturamento: fatDia
+                    faturamento: fatDia,
+                    repasse: repasseDia
                 });
             }
         }
@@ -196,6 +204,8 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
                 lucroTotal,
                 custosTotais,
                 faturamentoHoje,
+                repasseHoje,
+                totalRepasse,
                 crescimentoPercentual
             },
             tabelaConsolidada,
@@ -204,6 +214,7 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
                 linha: graficoLinha
             }
         });
+
 
     } catch (error) {
         console.error("Erro ao processar DRE:", error);

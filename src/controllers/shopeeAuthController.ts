@@ -337,9 +337,47 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
         let duplicados = 0;
         const skusNaoEncontrados = new Set<string>();
 
+        const mapaStatus: Record<string, string> = {
+            'READY_TO_SHIP': 'PRODUCAO',
+            'SHIPPED': 'ENVIADO',
+            'COMPLETED': 'ENVIADO',
+            'CANCELLED': 'CANCELADO'
+        };
+
         for (const pedidoShopee of pedidosShopee) {
+            const statusInterno = pedidoShopee.orderStatus ? (mapaStatus[pedidoShopee.orderStatus] || 'ENTRADA') : 'ENTRADA';
+            
             if (setDuplicados.has(pedidoShopee.orderSn)) {
                 duplicados++;
+                // Bug 3: Atualiza repasse e rastreio mesmo em pedidos duplicados
+                const updateFields: string[] = [];
+                const updateParams: any[] = [];
+                
+                if (pedidoShopee.valorRepasse !== undefined && pedidoShopee.valorRepasse !== null) {
+                    updateFields.push('VALOR_REPASSE = ?');
+                    updateParams.push(pedidoShopee.valorRepasse);
+                } else if (pedidoShopee.valorRepasse === null || pedidoShopee.valorRepasse === undefined) {
+                    console.log(`[Shopee Sync] Pedido ${pedidoShopee.orderSn} duplicado: campo de repasse ausente na API, ignorando atualização de repasse.`);
+                }
+
+                if (pedidoShopee.trackingNumber) {
+                    updateFields.push('COD_RASTREIO = ?');
+                    updateParams.push(pedidoShopee.trackingNumber);
+                }
+                
+                if (pedidoShopee.orderStatus) {
+                    updateFields.push('STATUS_PEDIDO = ?');
+                    updateParams.push(statusInterno);
+                }
+
+                if (updateFields.length > 0) {
+                    updateParams.push(pedidoShopee.orderSn);
+                    await connection.query(
+                        `UPDATE PEDIDO SET ${updateFields.join(', ')} WHERE NUM_PEDIDO_PLATAFORMA = ? AND PLATAFORMA_ORIGEM = 'Shopee'`,
+                        updateParams
+                    );
+                }
+                
                 continue;
             }
 
@@ -348,15 +386,16 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
 
             const [insertPedido]: any = await connection.query(
                 `INSERT INTO PEDIDO (NOME_CLIENTE, NUM_PEDIDO_PLATAFORMA, PLATAFORMA_ORIGEM, VALOR_TOTAL, DATA_PEDIDO, STATUS_PEDIDO, PRAZO_ENVIO, COD_RASTREIO, VALOR_REPASSE, OBSERVACOES)
-                 VALUES (?, ?, 'Shopee', ?, ?, 'ENTRADA', ?, ?, ?, ?)`,
+                 VALUES (?, ?, 'Shopee', ?, ?, ?, ?, ?, ?, ?)`,
                 [
                     pedidoShopee.nomeCliente,
                     pedidoShopee.orderSn,
                     pedidoShopee.valorTotal,
                     pedidoShopee.dataPedido,
-                    (pedidoShopee as any).prazoEnvio || null,
-                    (pedidoShopee as any).trackingNumber || null,
-                    (pedidoShopee as any).valorRepasse || null,
+                    statusInterno,
+                    pedidoShopee.prazoEnvio || null,
+                    pedidoShopee.trackingNumber || null,
+                    pedidoShopee.valorRepasse !== undefined ? pedidoShopee.valorRepasse : null,
                     pedidoShopee.observacoes || null
                 ]
             );
@@ -588,7 +627,58 @@ export const verificarEnviadosShopee = async (req: Request, res: Response) => {
                 }
             }
 
+            // Busca IDs dos pedidos que foram efetivamente atualizados para baixar estoque
+            let idsPedidosAtualizados: number[] = [];
+            if (atualizados > 0) {
+                const [pedidosAtualizados]: any = await connection.query(
+                    `SELECT ID_PEDIDO FROM PEDIDO WHERE PLATAFORMA_ORIGEM = 'Shopee' AND NUM_PEDIDO_PLATAFORMA IN (${placeholders}) AND STATUS_PEDIDO = 'ENVIADO'`,
+                    orderSns
+                );
+                idsPedidosAtualizados = pedidosAtualizados.map((p: any) => p.ID_PEDIDO);
+            }
+
             await connection.commit();
+
+            // Baixa de estoque para pedidos recém atualizados (fora da transação principal para não bloquear)
+            if (idsPedidosAtualizados.length > 0) {
+                const connBaixa = await pool.getConnection();
+                try {
+                    for (const idPedido of idsPedidosAtualizados) {
+                        // Verificar se já houve baixa
+                        const [jaFezBaixa]: any = await connBaixa.query(
+                            `SELECT COUNT(*) as total FROM MOVIMENTO_ESTOQUE WHERE ID_PEDIDO_REF = ? AND TIPO_MOVIMENTO = 'SAIDA_OP'`,
+                            [idPedido]
+                        );
+                        if (jaFezBaixa[0].total > 0) continue;
+
+                        // Calcula e executa a baixa
+                        const [materiais]: any = await connBaixa.query(`
+                            SELECT m.ID_MATERIA, m.SALDO_ESTOQUE, SUM(ft.QTD_CONSUMO * ip.QUANTIDADE) as TOTAL_NECESSARIO
+                            FROM ITEM_PEDIDO ip
+                            JOIN FICHA_TECNICA ft ON ip.ID_PRODUTO = ft.ID_PRODUTO
+                            JOIN MATERIA_PRIMA m ON ft.ID_MATERIA = m.ID_MATERIA
+                            WHERE ip.ID_PEDIDO = ?
+                            GROUP BY m.ID_MATERIA, m.SALDO_ESTOQUE
+                        `, [idPedido]);
+
+                        await connBaixa.beginTransaction();
+                        for (const item of materiais) {
+                            const saldoNovo = Math.max(0, Number(item.SALDO_ESTOQUE) - Number(item.TOTAL_NECESSARIO));
+                            await connBaixa.query('UPDATE MATERIA_PRIMA SET SALDO_ESTOQUE = ? WHERE ID_MATERIA = ?', [saldoNovo, item.ID_MATERIA]);
+                            await connBaixa.query(
+                                `INSERT INTO MOVIMENTO_ESTOQUE (ID_MATERIA, TIPO_MOVIMENTO, QTD_MOVIMENTADA, SALDO_ANTERIOR, SALDO_NOVO, ID_PEDIDO_REF) VALUES (?, 'SAIDA_OP', ?, ?, ?, ?)`,
+                                [item.ID_MATERIA, item.TOTAL_NECESSARIO, item.SALDO_ESTOQUE, saldoNovo, idPedido]
+                            );
+                        }
+                        await connBaixa.commit();
+                    }
+                } catch (baixaErr) {
+                    await connBaixa.rollback();
+                    console.error('[Estoque] Erro na baixa automática via verificarEnviados:', baixaErr);
+                } finally {
+                    connBaixa.release();
+                }
+            }
         } catch (dbError) {
             await connection.rollback();
             throw dbError;

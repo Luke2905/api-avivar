@@ -63,11 +63,13 @@ interface ShopeeRawOrder {
     total_amount?: number;
     actual_shipping_fee?: number;
     estimated_shipping_fee?: number;
+    escrow_amount?: number;  // Valor real de repasse ao vendedor (campo oficial da Shopee Open Platform)
     create_time?: number;
     ship_by_date?: number;
     item_list?: ShopeeRawOrderItem[];
     message_to_seller?: string;
     package_list?: ShopeePackage[];
+    order_status?: string;
 }
 
 export interface ShopeeOrderItem {
@@ -87,6 +89,7 @@ export interface ShopeeOrder {
     prazoEnvio?: Date | null;
     itens: ShopeeOrderItem[];
     observacoes?: string;
+    orderStatus?: string;
 }
 
 export interface BuscarPedidosShopeeParams {
@@ -325,9 +328,15 @@ function mapearPedidoShopee(rawOrder: ShopeeRawOrder): ShopeeOrder {
 
     const totalItens = itens.reduce((acc, item) => acc + (item.quantidade * item.valorUnitario), 0);
     const valorTotal = Math.max(0, toNumber(rawOrder.total_amount, totalItens));
-    // Valor de repasse = total - frete do vendedor (estimativa disponível na API)
-    const freteVendedor = toNumber(rawOrder.actual_shipping_fee ?? rawOrder.estimated_shipping_fee, 0);
-    const valorRepasse = Math.max(0, valorTotal - freteVendedor);
+    // Valor de repasse: usa escrow_amount (campo oficial da API Shopee) quando disponível.
+    // Fallback: total - frete estimado (menos preciso, mas funciona antes do pagamento ser liberado)
+    let valorRepasse: number;
+    if (rawOrder.escrow_amount !== undefined && rawOrder.escrow_amount !== null) {
+        valorRepasse = Math.max(0, toNumber(rawOrder.escrow_amount, 0));
+    } else {
+        const freteVendedor = toNumber(rawOrder.actual_shipping_fee ?? rawOrder.estimated_shipping_fee, 0);
+        valorRepasse = Math.max(0, valorTotal - freteVendedor);
+    }
 
     // Tracking number — extraído do primeiro pacote da lista
     const primeiroPackage = (rawOrder.package_list || [])[0];
@@ -348,7 +357,8 @@ function mapearPedidoShopee(rawOrder: ShopeeRawOrder): ShopeeOrder {
         dataPedido: new Date(createTime * 1000),
         prazoEnvio: shipByDate,
         itens,
-        observacoes: rawOrder.message_to_seller || ''
+        observacoes: rawOrder.message_to_seller || '',
+        orderStatus: rawOrder.order_status
     };
 }
 
@@ -483,7 +493,7 @@ class ShopeeService {
 
         for (const lote of lotes) {
             const timestamp = await this.obterTimestampShopee();
-            const responseOptionalFields = 'item_list,total_amount,buyer_username,recipient_address,create_time,message_to_seller,ship_by_date,actual_shipping_fee,package_list';
+            const responseOptionalFields = 'item_list,total_amount,buyer_username,recipient_address,create_time,message_to_seller,ship_by_date,actual_shipping_fee,package_list,escrow_amount';
             const authParams = this.authParams(ORDER_DETAIL_PATH, timestamp);
 
             const response = await this.client.get<ShopeeOrderDetailResponse>(

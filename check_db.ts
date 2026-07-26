@@ -1,16 +1,15 @@
 import pool from './src/config/database';
 
-async function check() {
+async function checkSchema() {
     try {
-        const [prod] = await pool.query('DESCRIBE PRODUTO');
-        console.log('PRODUTO:', prod);
-        
-        const [mat] = await pool.query('DESCRIBE MATERIA_PRIMA');
-        console.log('MATERIA_PRIMA:', mat);
-        process.exit(0);
-    } catch(e) {
+        const [materia]: any = await pool.query("DESCRIBE MATERIA_PRIMA");
+        console.log('MATERIA_PRIMA:', materia);
+        const [movimento]: any = await pool.query("DESCRIBE MOVIMENTO_ESTOQUE");
+        console.log('MOVIMENTO_ESTOQUE:', movimento);
+    } catch (e) {
         console.error(e);
-        process.exit(1);
+    } finally {
+        pool.end();
     }
 }
-check();
+checkSchema();

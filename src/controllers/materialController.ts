@@ -111,3 +111,41 @@ export const atualizarSaldo = async (req: Request, res: Response) => {
         res.status(500).json({ mensagem: 'Erro ao atualizar saldo.' });
     }
 };
+
+// GET: Relatório Kardex
+export const obterKardex = async (req: Request, res: Response) => {
+    const { materiaId } = req.query;
+    
+    try {
+        let query = `
+            SELECT 
+                mov.ID_MOVIMENTO,
+                mov.TIPO_MOVIMENTO,
+                mov.QTD_MOVIMENTADA,
+                mov.SALDO_ANTERIOR,
+                mov.SALDO_NOVO,
+                mov.DATA_MOVIMENTO,
+                mat.NOME_MATERIA,
+                mat.SKU_MATERIA,
+                mat.UNIDADE_MEDIDA,
+                ped.NUM_PEDIDO_PLATAFORMA
+            FROM MOVIMENTO_ESTOQUE mov
+            INNER JOIN MATERIA_PRIMA mat ON mov.ID_MATERIA = mat.ID_MATERIA
+            LEFT JOIN PEDIDO ped ON mov.ID_PEDIDO_REF = ped.ID_PEDIDO
+        `;
+        const params: any[] = [];
+
+        if (materiaId) {
+            query += ` WHERE mov.ID_MATERIA = ? `;
+            params.push(materiaId);
+        }
+
+        query += ` ORDER BY mov.DATA_MOVIMENTO DESC LIMIT 500 `;
+
+        const [rows] = await pool.query(query, params);
+        res.json(rows);
+    } catch (error) {
+        console.error('Erro ao buscar Kardex:', error);
+        res.status(500).json({ mensagem: 'Erro ao carregar relatório.' });
+    }
+};
