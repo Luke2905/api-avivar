@@ -43,15 +43,27 @@ export const listarCompras = async (req: Request, res: Response) => {
     try {
         const { whereClause, params } = montarFiltrosCompra(req.query);
 
+        const whereClauseNf = whereClause.replace(/c\.DATA_COMPRA/g, 'n.DATA_EMISSAO');
+
         const query = `
-            SELECT c.*, m.NOME_MATERIA, m.SKU_MATERIA, m.UNIDADE_MEDIDA
+            SELECT c.*, m.NOME_MATERIA, m.SKU_MATERIA, m.UNIDADE_MEDIDA, n.REFERENCIA, n.STATUS_NF, c.ID_NOTA_FISCAL
             FROM COMPRA c
             JOIN MATERIA_PRIMA m ON c.ID_MATERIA = m.ID_MATERIA
+            LEFT JOIN NOTA_FISCAL_ENTRADA n ON c.ID_NOTA_FISCAL = n.ID_NOTA
             ${whereClause}
-            ORDER BY c.DATA_COMPRA DESC
+            
+            UNION
+            
+            SELECT NULL as ID_COMPRA, NULL as ID_MATERIA, n.DATA_EMISSAO as DATA_COMPRA, 0 as QTD_COMPRADA, n.VALOR_TOTAL as CUSTO_TOTAL, n.FORNECEDOR as OBSERVACOES, n.ID_NOTA as ID_NOTA_FISCAL,
+                   'NOTA SEM ITENS' as NOME_MATERIA, '-' as SKU_MATERIA, '-' as UNIDADE_MEDIDA, n.REFERENCIA, n.STATUS_NF, n.ID_NOTA as ID_NOTA_FISCAL
+            FROM NOTA_FISCAL_ENTRADA n
+            LEFT JOIN COMPRA c ON n.ID_NOTA = c.ID_NOTA_FISCAL
+            WHERE c.ID_COMPRA IS NULL ${whereClauseNf ? 'AND ' + whereClauseNf.replace('WHERE', '') : ''}
+            
+            ORDER BY DATA_COMPRA DESC
         `;
 
-        const [rows] = await pool.query(query, params);
+        const [rows] = await pool.query(query, [...params, ...params]);
         res.json(rows);
     } catch (error) {
         console.error(error);

@@ -103,7 +103,7 @@ export const listarPedidos = async (req: Request, res: Response) => {
                 COALESCE(stats.QTD_TOTAL_ITENS, 0) as QTD_TOTAL_ITENS,
                 stats.resumo_itens,
                 COALESCE(custos.CUSTO_MATERIAIS_ESTIMADO, 0) as CUSTO_MATERIAIS_ESTIMADO,
-                (COALESCE(p.VALOR_TOTAL, 0) - COALESCE(custos.CUSTO_MATERIAIS_ESTIMADO, 0)) as LUCRO_BRUTO_ESTIMADO
+                (COALESCE(p.VALOR_REPASSE, 0) - COALESCE(custos.CUSTO_MATERIAIS_ESTIMADO, 0)) as LUCRO_BRUTO_ESTIMADO
             FROM PEDIDO p
             LEFT JOIN (
                 SELECT 
@@ -199,6 +199,9 @@ export const criarPedido = async (req: Request, res: Response) => {
             `, [novoIdPedido, item.id_produto, item.quantidade, item.valor_unitario]);
         }
 
+        // NOVO: Baixa de estoque imediata na criação do pedido
+        await tentarBaixarEstoque(novoIdPedido, connection);
+
         await connection.commit(); // Confirma tudo
         await registrarLog('SISTEMA', 'CRIAR_PEDIDO', `Pedido ${num_pedido} criado para ${nome_cliente}.`);
         res.status(201).json({ mensagem: 'Pedido e itens criados com sucesso!' });
@@ -212,8 +215,8 @@ export const criarPedido = async (req: Request, res: Response) => {
     }
 };
 
-// Helper: Baixa automática de matéria-prima ao mover pedido para PRODUCAO ou ENVIADO
-async function tentarBaixarEstoque(idPedido: string | number, connection: any): Promise<string> {
+// Helper: Baixa automática de matéria-prima (Agora exportado para uso na Sincronização Shopee)
+export async function tentarBaixarEstoque(idPedido: string | number, connection: any): Promise<string> {
     try {
         const queryCalculo = `
             SELECT 
@@ -270,11 +273,7 @@ export const atualizarStatusPedido = async (req: Request, res: Response) => {
         await connection.beginTransaction();
         await connection.query('UPDATE PEDIDO SET STATUS_PEDIDO = ? WHERE ID_PEDIDO = ?', [novo_status, id]);
 
-        let mensagemEstoque = '';
-        // Baixa automática ao mover para PRODUCAO ou ENVIADO
-        if (novo_status === 'PRODUCAO' || novo_status === 'ENVIADO') {
-            mensagemEstoque = await tentarBaixarEstoque(id, connection);
-        }
+        let mensagemEstoque = 'Baixa de estoque ocorre na entrada do pedido.';
 
         await connection.commit();
         await registrarLog('SISTEMA', 'ATUALIZAR_STATUS', `Status do pedido ${id} alterado para ${novo_status}. ${mensagemEstoque}`);
@@ -347,6 +346,9 @@ export const importarPedidosLote = async (req: Request, res: Response) => {
                         skusNaoEncontrados.push(skuLimpo);
                     }
                 }
+                
+                // NOVO: Baixa de estoque imediata na importação da planilha
+                await tentarBaixarEstoque(novoIdPedido, connection);
             }
         }
 
@@ -498,13 +500,7 @@ export const alterarStatusEmMassa = async (req: Request, res: Response) => {
             [novo_status, ...ids]
         );
 
-        let mensagemEstoque = '';
-        if (novo_status === 'PRODUCAO' || novo_status === 'ENVIADO') {
-            for (const id of ids) {
-                await tentarBaixarEstoque(id, connection);
-            }
-            mensagemEstoque = ' (Estoque atualizado)';
-        }
+        let mensagemEstoque = ' (Estoque não é mais baixado na alteração de status)';
 
         await connection.commit();
         await registrarLog('SISTEMA', 'ALTERAR_STATUS_MASSA', `${result.affectedRows} pedidos movidos para ${novo_status}.${mensagemEstoque}`);

@@ -9,7 +9,7 @@ interface TokenPayload {
   exp: number;
 }
 
-export type UserRole = 'ADMIN' | 'PRODUCAO' | 'ARTES' | 'FINANCEIRO';
+export type UserRole = 'ADMIN' | 'PRODUCAO' | 'ARTES' | 'FINANCEIRO' | 'COMPRADOR';
 
 export interface AuthUser {
   id: number;

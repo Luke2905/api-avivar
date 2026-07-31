@@ -4,11 +4,11 @@ import pool from '../config/database';
 export const getResumoFinanceiro = async (req: Request, res: Response) => {
   try {
     const [faturamento]: any = await pool.query(`
-      SELECT SUM(VALOR_TOTAL) as total FROM PEDIDO WHERE STATUS_PEDIDO != 'CANCELADO'
+      SELECT SUM(VALOR_TOTAL) as total, SUM(VALOR_REPASSE) as repasse FROM PEDIDO WHERE STATUS_PEDIDO != 'CANCELADO'
     `);
 
     const [faturamentoDiario]: any = await pool.query(`
-      SELECT SUM(VALOR_TOTAL) as total
+      SELECT SUM(VALOR_TOTAL) as total, SUM(VALOR_REPASSE) as repasse
       FROM PEDIDO
       WHERE STATUS_PEDIDO != 'CANCELADO'
         AND DATE(DATA_PEDIDO) = CURDATE()
@@ -58,6 +58,9 @@ export const getResumoFinanceiro = async (req: Request, res: Response) => {
 
     const faturamentoTotalValor = Number(faturamento[0].total || 0);
     const faturamentoDiarioValor = Number(faturamentoDiario[0].total || 0);
+    
+    const repasseTotalValor = Number(faturamento[0].repasse || 0);
+    const repasseDiarioValor = Number(faturamentoDiario[0].repasse || 0);
     const despesasPagasValor = Number(despesasOps[0].total || 0);
     const despesasPagasDiariasValor = Number(despesasOpsDiarias[0].total || 0);
     const comprasTotalValor = Number(comprasMateria[0].total || 0);
@@ -66,10 +69,10 @@ export const getResumoFinanceiro = async (req: Request, res: Response) => {
     const totalSaidas = despesasPagasValor + comprasTotalValor;
     const totalSaidasDiarias = despesasPagasDiariasValor + comprasDiariasValor;
 
-    const lucroBruto = faturamentoTotalValor - comprasTotalValor;
-    const lucroBrutoDiario = faturamentoDiarioValor - comprasDiariasValor;
-    const faturamentoLiquido = faturamentoTotalValor - totalSaidas;
-    const faturamentoLiquidoDiario = faturamentoDiarioValor - totalSaidasDiarias;
+    const lucroBruto = repasseTotalValor - comprasTotalValor;
+    const lucroBrutoDiario = repasseDiarioValor - comprasDiariasValor;
+    const faturamentoLiquido = repasseTotalValor - totalSaidas;
+    const faturamentoLiquidoDiario = repasseDiarioValor - totalSaidasDiarias;
 
     res.json({
       faturamento: faturamentoTotalValor,

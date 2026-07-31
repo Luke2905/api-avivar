@@ -94,8 +94,12 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
             const custoMaoDeObra = itensDoMes.reduce((acc: number, i: any) => acc + (Number(i.QUANTIDADE) * Number(i.MAO_DE_OBRA_VALOR || 0)), 0);
 
             const manual = dadosManuais.find((d: any) => d.MES === m) || {
-                META_FATURAMENTO: 0, INVESTIMENTO_ADS: 0, NOVAS_MAQUINAS: 0, CUSTO_NAO_PRODUTIVO: 0
+                META_FATURAMENTO: 0, INVESTIMENTO_ADS: 0, NOVAS_MAQUINAS: 0, CUSTO_NAO_PRODUTIVO: 0, FATURAMENTO_MANUAL: 0
             };
+
+            const faturamentoManual = Number(manual.FATURAMENTO_MANUAL || 0);
+            const faturamentoPlataformaMes = faturamento;
+            const faturamentoTotalMes = faturamentoPlataformaMes + faturamentoManual;
 
             const ads = Number(manual.INVESTIMENTO_ADS || 0);
             const maquinas = Number(manual.NOVAS_MAQUINAS || 0);
@@ -103,8 +107,9 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
             const meta = Number(manual.META_FATURAMENTO || 0);
 
             const custoTotal = custoProducao + custoMaoDeObra + ads + maquinas + nProdutivo;
-            const lucroLiquido = faturamento - custoTotal;
-            const margemPercentual = faturamento > 0 ? (lucroLiquido / faturamento) * 100 : 0;
+            const faturamentoBaseLucro = totalRepasse + faturamentoManual;
+            const lucroLiquido = faturamentoBaseLucro - custoTotal;
+            const margemPercentual = faturamentoBaseLucro > 0 ? (lucroLiquido / faturamentoBaseLucro) * 100 : 0;
 
             return {
                 mes: m,
@@ -112,7 +117,9 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
                 qtdVendas,
                 qtdProdutos,
                 meta,
-                faturamento,
+                faturamento: faturamentoTotalMes,
+                faturamentoManual,
+                faturamentoPlataforma: faturamentoPlataformaMes,
                 totalRepasse,
                 custoProducao,
                 custoMaoDeObra,
@@ -223,26 +230,28 @@ export const obterDREConsolidado = async (req: Request, res: Response) => {
 };
 
 export const salvarDadosFinanceirosMensais = async (req: Request, res: Response) => {
-    const { mes, ano, meta_faturamento, investimento_ads, novas_maquinas, custo_nao_produtivo } = req.body;
+    const { mes, ano, meta_faturamento, investimento_ads, novas_maquinas, custo_nao_produtivo, faturamento_manual } = req.body;
 
     if (!mes || !ano) return res.status(400).json({ mensagem: "Mês e Ano são obrigatórios" });
 
     try {
         await pool.query(`
             INSERT INTO DADOS_FINANCEIROS_MENSAL 
-            (MES, ANO, META_FATURAMENTO, INVESTIMENTO_ADS, NOVAS_MAQUINAS, CUSTO_NAO_PRODUTIVO)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (MES, ANO, META_FATURAMENTO, INVESTIMENTO_ADS, NOVAS_MAQUINAS, CUSTO_NAO_PRODUTIVO, FATURAMENTO_MANUAL)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE 
             META_FATURAMENTO = VALUES(META_FATURAMENTO),
             INVESTIMENTO_ADS = VALUES(INVESTIMENTO_ADS),
             NOVAS_MAQUINAS = VALUES(NOVAS_MAQUINAS),
-            CUSTO_NAO_PRODUTIVO = VALUES(CUSTO_NAO_PRODUTIVO)
+            CUSTO_NAO_PRODUTIVO = VALUES(CUSTO_NAO_PRODUTIVO),
+            FATURAMENTO_MANUAL = VALUES(FATURAMENTO_MANUAL)
         `, [
             mes, ano, 
             meta_faturamento || 0, 
             investimento_ads || 0, 
             novas_maquinas || 0, 
-            custo_nao_produtivo || 0
+            custo_nao_produtivo || 0,
+            faturamento_manual || 0
         ]);
 
         await registrarLog('SISTEMA', 'ATUALIZAR_METAS_FINANCEIRAS', `Metas e Custos do mês ${mes}/${ano} atualizados.`);

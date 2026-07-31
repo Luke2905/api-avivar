@@ -6,6 +6,7 @@ import path from 'path';
 import pool from '../config/database';
 import { registrarLog } from '../services/logService';
 import { buscarPedidosShopee, buscarCatalogoShopee } from '../services/shopeeService';
+import { tentarBaixarEstoque } from './pedidoController';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -338,7 +339,7 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
         const skusNaoEncontrados = new Set<string>();
 
         const mapaStatus: Record<string, string> = {
-            'READY_TO_SHIP': 'PRODUCAO',
+            'READY_TO_SHIP': 'ENTRADA',
             'SHIPPED': 'ENVIADO',
             'COMPLETED': 'ENVIADO',
             'CANCELLED': 'CANCELADO'
@@ -427,6 +428,9 @@ export const sincronizarPedidosShopee = async (req: Request, res: Response) => {
 
                 itensCriados++;
             }
+            
+            // NOVO: Baixa de estoque imediata na sincronização da Shopee
+            await tentarBaixarEstoque(idPedido, connection);
         }
         const tipoSync = req.body.tipo === 'auto' ? 'auto' : 'manual';
         const statusSync = skusNaoEncontrados.size > 0 ? 'parcial' : 'sucesso';
